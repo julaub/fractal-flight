@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>Fractal Alps — Mandelbrot Flight</title>
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<canvas id="c"></canvas>
+
+<div id="rings-score">
+  <span class="label">RINGS</span>
+  <span id="score">0</span>
+</div>
+
+<div id="hud">
+  <h1>Fractal Alps · Mandelbrot Flight</h1>
+  <div class="row"><span class="key">A</span><span class="key">D</span><span class="desc">steer · bank</span></div>
+  <div class="row"><span class="key">W</span><span class="key">S</span><span class="desc">pitch · dive / climb</span></div>
+  <div class="row"><span class="key">Q</span><span class="key">E</span><span class="desc">altitude</span></div>
+  <div class="row"><span class="key">SHIFT</span><span class="desc">throttle boost</span></div>
+  <div class="row"><span class="key">R</span><span class="desc">reset position</span></div>
+  <div class="row"><span class="key">DRAG</span><span class="desc">reposition sun</span></div>
+  <div class="touch-hint">stick: steer &amp; pitch · drag sky: sun<br>tilt: steer with phone orientation</div>
+</div>
+
+<div id="touch-ui">
+  <div id="joystick"><div id="stick"></div></div>
+  <div class="tbtn" id="btn-boost">BOOST</div>
+  <div class="tbtn" id="btn-up">&#9650;</div>
+  <div class="tbtn" id="btn-down">&#9660;</div>
+  <div class="tbtn" id="btn-reset">R</div>
+  <div class="tbtn" id="btn-tilt">TILT</div>
+</div>
+
+<div id="toast"></div>
+
+<div id="compass">
+  <svg viewBox="-50 -50 100 100">
+    <circle cx="0" cy="0" r="42" fill="none" stroke="rgba(255,200,130,0.2)" stroke-width="0.5"/>
+    <line id="cneedle" x1="0" y1="0" x2="0" y2="-32" stroke="rgba(255,200,130,0.9)" stroke-width="1.5"/>
+    <circle cx="0" cy="0" r="2" fill="rgba(255,200,130,0.9)"/>
+    <text x="0" y="-38" text-anchor="middle" fill="rgba(255,200,130,0.7)" font-size="7" font-family="monospace">N</text>
+  </svg>
+</div>
+
+<div id="info">
+  <div>ALT  <span id="alt">0</span> m</div>
+  <div>SPD  <span id="spd">0</span> kn</div>
+  <div>HDG  <span id="hdg">000</span>°</div>
+  <div>FPS  <span id="fps">0</span></div>
+</div>
+
+<pre id="err"></pre>
+
+<script type="module" src="js/main.js"></script>
+</body>
+</html>
