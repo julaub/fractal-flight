@@ -49,6 +49,11 @@ function jridged(x, y, oct) {
   return v;
 }
 
+function jsmoothstep(a, b, x) {
+  const t = Math.max(0, Math.min(1, (x - a) / (b - a)));
+  return t * t * (3 - 2 * t);
+}
+
 function jMandelDE(cx, cy, maxIter) {
   let zx = 0, zy = 0, dzx = 0, dzy = 0, m2 = 0;
   for (let i = 0; i < maxIter; i++) {
@@ -83,6 +88,11 @@ export function terrainHeightJS(x, z) {
 
   // smax(baseElev, mountainCapped, 45)
   const k = 45;
-  const h = Math.max(0, Math.min(1, 0.5 + 0.5 * (mountainCapped - baseElev) / k));
-  return baseElev * (1 - h) + mountainCapped * h + k * h * (1 - h);
+  const t = Math.max(0, Math.min(1, 0.5 + 0.5 * (mountainCapped - baseElev) / k));
+  const h = baseElev * (1 - t) + mountainCapped * t + k * t * (1 - t);
+
+  // lake/ocean carving (matches GPU terrainShape): mix(h, -15, lake * 0.7)
+  const valley = jfbm(x * 0.0003 + 200, z * 0.0003 + 200, 3);
+  const lake = jsmoothstep(0.55, 0.7, valley) * (1 - mass);
+  return h * (1 - lake * 0.7) - 15 * lake * 0.7;
 }

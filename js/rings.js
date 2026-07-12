@@ -29,31 +29,34 @@ export function initRings() {
   }
 }
 
+const LAND_MIN_H = 30; // minimum terrain height (m) to anchor a ring over land
+
 function spawnRing(index, fromPos, fromFwd) {
-  const dist = 400 + Math.random() * 300;
-  const offsetRight = (Math.random() - 0.5) * 250;
+  // Try a fan of candidate directions: early attempts follow the chain
+  // heading, later ones swing wider so the course turns back over mountains
+  // instead of continuing out over water. If nothing clears LAND_MIN_H,
+  // fall back to the highest-terrain candidate seen.
+  const baseYaw = Math.atan2(fromFwd[0], fromFwd[2]);
+  let best = null;
+  for (let attempt = 0; attempt < 12; attempt++) {
+    const spread = 0.4 + 2.0 * attempt / 11; // total fan width in radians
+    const yaw = baseYaw + (Math.random() - 0.5) * spread;
+    const dist = 400 + Math.random() * 300;
+    const x = fromPos[0] + Math.sin(yaw) * dist;
+    const z = fromPos[2] + Math.cos(yaw) * dist;
+    const h = terrainHeightJS(x, z);
+    if (best === null || h > best.h) best = { x, z, h };
+    if (h > LAND_MIN_H) { best = { x, z, h }; break; }
+  }
 
-  let right = normalize3(cross3(fromFwd, [0, 1, 0]));
-  if (!isFinite(right[0])) right = [1, 0, 0];
-
-  // Compute XZ position first
-  const pos = [
-    fromPos[0] + fromFwd[0] * dist + right[0] * offsetRight,
-    0, // will be set from terrain below
-    fromPos[2] + fromFwd[2] * dist + right[2] * offsetRight
-  ];
-
-  // Place ring above terrain with generous clearance (100–220m above ground)
-  const terrainH = terrainHeightJS(pos[0], pos[2]);
+  // Place ring above terrain with generous clearance (100–220m above ground),
+  // with a minimum flying altitude
   const clearance = 100 + Math.random() * 120;
-  pos[1] = terrainH + clearance;
-
-  // Ensure minimum flying altitude
-  pos[1] = Math.max(pos[1], 150);
+  const pos = [best.x, Math.max(best.h + clearance, 150), best.z];
 
   // Orient ring to face the travel direction (from previous ring to this one)
   let fwd = normalize3([pos[0] - fromPos[0], pos[1] - fromPos[1], pos[2] - fromPos[2]]);
-  right = normalize3(cross3(fwd, [0, 1, 0]));
+  let right = normalize3(cross3(fwd, [0, 1, 0]));
   if (!isFinite(right[0])) right = [1, 0, 0];
   let up = cross3(right, fwd);
 
