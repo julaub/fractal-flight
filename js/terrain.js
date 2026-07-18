@@ -1,67 +1,44 @@
-// CPU-side terrain height, mirroring the GPU terrainShape() in shaders.js
-// (fewer octaves/iterations — good enough for gameplay queries like ring
-// placement, cheap enough to call per spawn).
+import { TUNE } from './tune.js';
 
-import { MB_CX, MB_CY, MB_SCL } from './config.js';
-
-function fract(x) { return x - Math.floor(x); }
-
-function jhash(x, y) {
-  let px = fract(x * 123.34);
-  let py = fract(y * 456.21);
-  const d = px * px + py * py + (px + py) * 45.32;
-  px += d; py += d;
-  return fract(px * py);
+// ============ CPU TERRAIN MIRROR (for collision) ============
+// Exact port of the shader's terrainShape so the crash check agrees with the
+// pixels. Uses the live TUNE values, so tuned worlds collide correctly too.
+const fract = x => x - Math.floor(x);
+function hashJ(px, py) {
+  // exact port of the GLSL hash12 (v4.5)
+  let ax = fract(px * 0.1031), ay = fract(py * 0.1031), az = fract(px * 0.1031);
+  const d = ax * (ay + 33.33) + ay * (az + 33.33) + az * (ax + 33.33);
+  ax += d; ay += d; az += d;
+  return fract((ax + ay) * az);
 }
-
-function jnoise(x, y) {
-  const ix = Math.floor(x), iy = Math.floor(y);
-  let fx = x - ix, fy = y - iy;
-  fx = fx * fx * (3 - 2 * fx);
-  fy = fy * fy * (3 - 2 * fy);
-  const a = jhash(ix, iy);
-  const b = jhash(ix + 1, iy);
-  const c = jhash(ix, iy + 1);
-  const d = jhash(ix + 1, iy + 1);
-  return (a * (1 - fx) + b * fx) * (1 - fy) + (c * (1 - fx) + d * fx) * fy;
+function noiseJ(px, py) {
+  const ix = Math.floor(px), iy = Math.floor(py);
+  let fx = px - ix, fy = py - iy;
+  // quintic fade — MUST match the GLSL noise() (v4.2)
+  fx = fx * fx * fx * (fx * (fx * 6 - 15) + 10);
+  fy = fy * fy * fy * (fy * (fy * 6 - 15) + 10);
+  const a = hashJ(ix, iy), b = hashJ(ix + 1, iy), c = hashJ(ix, iy + 1), d = hashJ(ix + 1, iy + 1);
+  return (a + (b - a) * fx) + ((c + (d - c) * fx) - (a + (b - a) * fx)) * fy;
 }
-
-function jfbm(x, y, oct) {
+function fbmJ(px, py, oct) {
   let v = 0, a = 0.5;
-  for (let i = 0; i < oct; i++) {
-    v += a * jnoise(x, y);
-    x = x * 2 + 13.7; y = y * 2 + 7.3;
-    a *= 0.5;
-  }
+  for (let i = 0; i < oct; i++) { v += a * noiseJ(px, py); px = px * 2 + 13.7; py = py * 2 + 7.3; a *= 0.5; }
   return v;
 }
-
-function jridged(x, y, oct) {
+function ridgedJ(px, py, oct) {
   let v = 0, a = 0.5, prev = 1;
   for (let i = 0; i < oct; i++) {
-    let n = 1 - Math.abs(jnoise(x, y) * 2 - 1);
-    n = n * n;
-    v += a * n * prev;
-    prev = n;
-    x = x * 2 + 7.3; y = y * 2 + 13.7;
-    a *= 0.5;
+    let n = 1 - Math.abs(noiseJ(px, py) * 2 - 1); n *= n;
+    v += a * n * prev; prev = n; px = px * 2 + 7.3; py = py * 2 + 13.7; a *= 0.5;
   }
   return v;
 }
-
-function jsmoothstep(a, b, x) {
-  const t = Math.max(0, Math.min(1, (x - a) / (b - a)));
-  return t * t * (3 - 2 * t);
-}
-
-function jMandelDE(cx, cy, maxIter) {
+function mandelDEJ(cx, cy) {
   let zx = 0, zy = 0, dzx = 0, dzy = 0, m2 = 0;
-  for (let i = 0; i < maxIter; i++) {
-    const ndzx = 2 * (zx * dzx - zy * dzy) + 1;
-    const ndzy = 2 * (zx * dzy + zy * dzx);
+  for (let i = 0; i < 26; i++) {
+    const ndzx = 2 * (zx * dzx - zy * dzy) + 1, ndzy = 2 * (zx * dzy + zy * dzx);
     dzx = ndzx; dzy = ndzy;
-    const nzx = zx * zx - zy * zy + cx;
-    const nzy = 2 * zx * zy + cy;
+    const nzx = zx * zx - zy * zy + cx, nzy = 2 * zx * zy + cy;
     zx = nzx; zy = nzy;
     m2 = zx * zx + zy * zy;
     if (m2 > 1e6) break;
@@ -69,30 +46,28 @@ function jMandelDE(cx, cy, maxIter) {
   if (m2 < 4) return 0;
   return Math.sqrt(m2 / Math.max(dzx * dzx + dzy * dzy, 1e-12)) * 0.5 * Math.log(m2);
 }
-
-export function terrainHeightJS(x, z) {
-  const cx = x * MB_SCL + MB_CX;
-  const cy = z * MB_SCL + MB_CY;
-  const de = jMandelDE(cx, cy, 18);
-  const mass = Math.exp(-de * 14);
-
-  const qx = jfbm(x * 0.0009, z * 0.0009, 3);
-  const qy = jfbm(x * 0.0009 + 5.2, z * 0.0009 + 1.3, 3);
-  const pwx = x + qx * 60;
-  const pwz = z + qy * 60;
-
-  const mountain = (80 + 400 * jridged(pwx * 0.0016, pwz * 0.0016, 4)) * mass;
-  const mountainCapped = 460 * Math.tanh(mountain / 460);
-
-  const baseElev = jfbm(x * 0.0004, z * 0.0004, 3) * 90 - 12;
-
-  // smax(baseElev, mountainCapped, 45)
-  const k = 45;
-  const t = Math.max(0, Math.min(1, 0.5 + 0.5 * (mountainCapped - baseElev) / k));
-  const h = baseElev * (1 - t) + mountainCapped * t + k * t * (1 - t);
-
-  // lake/ocean carving (matches GPU terrainShape): mix(h, -15, lake * 0.7)
-  const valley = jfbm(x * 0.0003 + 200, z * 0.0003 + 200, 3);
-  const lake = jsmoothstep(0.55, 0.7, valley) * (1 - mass);
-  return h * (1 - lake * 0.7) - 15 * lake * 0.7;
+function smaxJ(a, b, k) {
+  const hh = Math.max(0, Math.min(1, 0.5 + 0.5 * (a - b) / k));
+  return -((-b) * (1 - hh) + (-a) * hh - k * hh * (1 - hh));
+}
+export function terrainShapeJ(px, pz) {
+  const w1 = mandelDEJ(px * 2.5e-4 - 0.55, pz * 2.5e-4) / 2.5e-4;
+  const w2 = mandelDEJ(px * 1e-4 - 0.55, (pz - 14000) * 1e-4) / 1e-4;
+  const wde = Math.min(w1, w2);
+  const mass = Math.exp(-wde * TUNE.massDecay.v);
+  const base = fbmJ(px * 0.0004, pz * 0.0004, 3) * 70 + 4 - Math.min(wde * TUNE.oceanSlope.v, TUNE.oceanMax.v);
+  const qx = fbmJ(px * 0.0009, pz * 0.0009, 3), qy = fbmJ(px * 0.0009 + 5.2, pz * 0.0009 + 1.3, 3);
+  const wx = px + qx * 60, wz = pz + qy * 60;
+  const th = 17.3 / (TUNE.snowyPct.v / 100 + 6.44) - 2.32;
+  const sel = fbmJ(px * 0.00018, pz * 0.00018, 2);
+  let tt = Math.max(0, Math.min(1, (sel - (th - 0.05)) / 0.1)); tt = tt * tt * (3 - 2 * tt);
+  let m = (80 + TUNE.mountAmp.v * ridgedJ(wx * 0.0016, wz * 0.0016, 5)) * mass * (0.42 + 0.68 * tt);
+  m = 460 * Math.tanh(m / 460) - 70 * (1 - mass);
+  let hh = smaxJ(base, m, 45);
+  const val = fbmJ(px * 0.0003 + 200, pz * 0.0003 + 200, 3);
+  let lk = Math.max(0, Math.min(1, (val - 0.58) / 0.14)); lk = lk * lk * (3 - 2 * lk);
+  let mk = Math.max(0, Math.min(1, (mass - 0.4) / 0.5)); mk = mk * mk * (3 - 2 * mk);
+  let pk = 1 - Math.max(0, Math.min(1, (m - 30) / 50)); const s3 = x => x * x * (3 - 2 * x);
+  const lake = lk * mk * s3(Math.max(0, Math.min(1, pk)));
+  return hh * (1 - lake * 0.65) + (-15) * lake * 0.65;
 }
