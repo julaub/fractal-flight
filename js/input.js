@@ -1,58 +1,101 @@
-// All input sources: keyboard, sun drag (mouse/touch), virtual joystick,
-// touch buttons, and gyroscope tilt. Each source writes into its own state
-// object; the flight model sums and clamps them, so sources can be combined.
+// All input sources: keyboard, mouse (fire / bomb / sun drag), virtual
+// joystick, touch buttons, and gyroscope tilt. Each source writes into its
+// own state object; the flight model sums and clamps them.
 
 import { sun } from './state.js';
+import { canvas } from './renderer.js';
+import { ensureAudio, toggleMute } from './audio.js';
+import { fireGun, dropBomb } from './weapons.js';
 import { toast, hideToast } from './hud.js';
 
 export const keys = Object.create(null);
 export const touchInput = { steer: 0, pitch: 0, lift: 0, boost: false };
 export const gyroInput = { steer: 0, pitch: 0 };
+export const mouse = { lmbDown: false, lastAuto: 0 };   // hold-to-burst state, read by flight.js
 
 export const IS_TOUCH = window.matchMedia('(pointer: coarse)').matches || 'ontouchstart' in window;
+if (IS_TOUCH) document.body.classList.add('touch');
+
+export function initInput(onReset) {
+window.addEventListener('keydown', e => {
+  keys[e.code] = true;
+  ensureAudio();
+  if (e.code === 'KeyM') toggleMute();
+  if (e.code === 'KeyR') onReset();
+  if (['KeyW','KeyA','KeyS','KeyD','KeyQ','KeyE','Space'].includes(e.code)) e.preventDefault();
+});
+canvas.addEventListener('pointerdown', ensureAudio);
+window.addEventListener('keyup', e => { keys[e.code] = false; });
+
+// LEFT button: fire (hold = burst). RIGHT button: quick click drops a bomb,
+// press-and-move (or hold >260 ms) repositions the sun.
+let rbDown = false, rbStartT = 0, rbStartX = 0, rbStartY = 0, sunDragging = false;
+let lastMX = 0, lastMY = 0;
+canvas.addEventListener('contextmenu', e => e.preventDefault());
+canvas.addEventListener('mousedown', e => {
+  if (IS_TOUCH) return;   // touch uses the on-screen buttons + sun drag below
+  if (e.button === 0) {
+    fireGun();
+    mouse.lmbDown = true; mouse.lastAuto = performance.now();
+  } else if (e.button === 2) {
+    rbDown = true; sunDragging = false;
+    rbStartT = performance.now();
+    rbStartX = lastMX = e.clientX; rbStartY = lastMY = e.clientY;
+  }
+});
+window.addEventListener('mouseup', e => {
+  if (e.button === 0) mouse.lmbDown = false;
+  if (e.button === 2) {
+    if (rbDown && !sunDragging && performance.now() - rbStartT < 260) dropBomb();
+    rbDown = false; sunDragging = false;
+  }
+});
+window.addEventListener('mousemove', e => {
+  if (!rbDown) return;
+  if (!sunDragging) {
+    const moved = Math.abs(e.clientX - rbStartX) + Math.abs(e.clientY - rbStartY);
+    if (moved > 6 || performance.now() - rbStartT > 260) sunDragging = true;
+  }
+  if (sunDragging) {
+    sun.az += (e.clientX - lastMX) * 0.005;
+    sun.el = Math.min(1.25, Math.max(0.04, sun.el - (e.clientY - lastMY) * 0.004));
+  }
+  lastMX = e.clientX; lastMY = e.clientY;
+});
+window.addEventListener('blur', () => {
+  for (const k in keys) keys[k] = false;
+  mouse.lmbDown = false; rbDown = false; sunDragging = false;
+});
+
+// ---- touch + gyro ----
+// Each input source writes its own state object; update() sums and clamps,
+// so keyboard, joystick and tilt can be combined freely.
+
 
 // setPointerCapture throws on synthetic events and must never block input
 function capture(el, id) { try { el.setPointerCapture(id); } catch (_) {} }
 
-export function initInput(canvas, onReset) {
-  // ---- keyboard ----
-  window.addEventListener('keydown', e => {
-    keys[e.code] = true;
-    if (e.code === 'KeyR') onReset();
-    if (['KeyW','KeyA','KeyS','KeyD','KeyQ','KeyE'].includes(e.code)) e.preventDefault();
-  });
-  window.addEventListener('keyup', e => { keys[e.code] = false; });
-  window.addEventListener('blur', () => { for (const k in keys) keys[k] = false; });
-
-  // ---- sun drag (pointer events: mouse and touch) ----
-  let dragId = null, lastMX = 0, lastMY = 0;
+if (IS_TOUCH) (function initTouch() {
+  // ---- sun drag on the canvas (pointer events) ----
+  let dragId = null, tLastX = 0, tLastY = 0;
   canvas.addEventListener('pointerdown', e => {
     if (dragId !== null) return;
-    dragId = e.pointerId; lastMX = e.clientX; lastMY = e.clientY;
+    e.preventDefault();          // also suppresses the synthetic mousedown
+    ensureAudio();
+    dragId = e.pointerId; tLastX = e.clientX; tLastY = e.clientY;
     capture(canvas, e.pointerId);
   });
   canvas.addEventListener('pointermove', e => {
     if (e.pointerId !== dragId) return;
-    sun.az += (e.clientX - lastMX) * 0.005;
-    sun.el = Math.min(1.25, Math.max(0.04, sun.el - (e.clientY - lastMY) * 0.004));
-    lastMX = e.clientX; lastMY = e.clientY;
+    sun.az += (e.clientX - tLastX) * 0.005;
+    sun.el = Math.min(1.25, Math.max(0.04, sun.el - (e.clientY - tLastY) * 0.004));
+    tLastX = e.clientX; tLastY = e.clientY;
   });
   const endSunDrag = e => { if (e.pointerId === dragId) dragId = null; };
   canvas.addEventListener('pointerup', endSunDrag);
   canvas.addEventListener('pointercancel', endSunDrag);
 
-  initTouch(onReset);
-  initGyro();
-
-  // Debug handle for the browser console (read-only inspection)
-  window.__fractalInput = { keys, touchInput, gyroInput };
-
-  // Block iOS Safari scroll / pull-to-refresh / double-tap zoom
-  document.addEventListener('touchmove', e => e.preventDefault(), { passive: false });
-}
-
-// ---- virtual joystick + touch buttons ----
-function initTouch(onReset) {
+  // ---- virtual joystick ----
   const joyEl = document.getElementById('joystick');
   const stickEl = document.getElementById('stick');
   let joyId = null;
@@ -70,6 +113,7 @@ function initTouch(onReset) {
   }
   joyEl.addEventListener('pointerdown', e => {
     e.preventDefault();
+    ensureAudio();
     joyId = e.pointerId;
     moveStick(e);
     capture(joyEl, e.pointerId);
@@ -84,10 +128,12 @@ function initTouch(onReset) {
   joyEl.addEventListener('pointerup', endJoy);
   joyEl.addEventListener('pointercancel', endJoy);
 
+  // ---- hold buttons ----
   function holdButton(id, on, off) {
     const el = document.getElementById(id);
     el.addEventListener('pointerdown', e => {
       e.preventDefault();
+      ensureAudio();
       el.classList.add('on');
       on();
       capture(el, e.pointerId);
@@ -99,24 +145,32 @@ function initTouch(onReset) {
   holdButton('btn-boost', () => { touchInput.boost = true; }, () => { touchInput.boost = false; });
   holdButton('btn-up',    () => { touchInput.lift = 1; },     () => { touchInput.lift = 0; });
   holdButton('btn-down',  () => { touchInput.lift = -1; },    () => { touchInput.lift = 0; });
-  document.getElementById('btn-reset').addEventListener('pointerdown', e => {
-    e.preventDefault();
-    onReset();
+  // FIRE reuses the desktop hold-to-burst path; BOMB is a tap
+  holdButton('btn-fire',  () => { fireGun(); lmbDown = true; lastAuto = performance.now(); },
+                          () => { lmbDown = false; });
+  document.getElementById('btn-bomb').addEventListener('pointerdown', e => {
+    e.preventDefault(); ensureAudio(); dropBomb();
   });
-}
+  document.getElementById('btn-reset').addEventListener('pointerdown', e => {
+    e.preventDefault(); onReset();
+  });
 
-// ---- gyroscope tilt ----
-function initGyro() {
-  const gyro = { on: false, needCal: false, calSteer: 0, calPitch: 0, lastData: -1, source: null, checkTimer: 0 };
+  // Block iOS Safari scroll / pull-to-refresh / double-tap zoom
+  document.addEventListener('touchmove', e => e.preventDefault(), { passive: false });
+})();
+
+// ---- gyroscope tilt (works alongside the joystick) ----
+(function initGyro() {
   const tiltBtn = document.getElementById('btn-tilt');
+  if (!tiltBtn) return;
+  const gyro = { on: false, needCal: false, calSteer: 0, calPitch: 0, lastData: -1, source: null, checkTimer: 0 };
 
   function orientAngle() {
     if (screen.orientation && typeof screen.orientation.angle === 'number') return screen.orientation.angle;
     return window.orientation || 0;
   }
 
-  // Remap beta (front-back) / gamma (left-right) to steer/pitch axes for the
-  // current screen rotation, so tilt works in both portrait and landscape.
+  // Remap beta/gamma to steer/pitch for the current screen rotation
   function tiltAxes(e) {
     const a = ((orientAngle() % 360) + 360) % 360;
     const beta = e.beta || 0, gamma = e.gamma || 0;
@@ -127,8 +181,7 @@ function initGyro() {
   }
 
   function onTilt(e) {
-    if (e.beta === null && e.gamma === null) return; // event fired but sensor blocked/empty
-    // Prefer relative events; use 'deviceorientationabsolute' only if that's all the browser delivers
+    if (e.beta === null && e.gamma === null) return; // sensor blocked/empty
     if (e.type === 'deviceorientationabsolute') {
       if (gyro.source === 'deviceorientation') return;
     } else {
@@ -147,8 +200,8 @@ function initGyro() {
       const m = Math.abs(d) < DEAD ? 0 : (Math.abs(d) - DEAD) / RANGE;
       return Math.sign(d) * Math.min(1, m);
     };
-    gyroInput.steer = -shape(ax.steer - gyro.calSteer); // tilt right = bank right (matches D)
-    gyroInput.pitch = shape(ax.pitch - gyro.calPitch);  // tilt forward = nose down (matches W)
+    gyroInput.steer = -shape(ax.steer - gyro.calSteer); // tilt right = bank right
+    gyroInput.pitch = shape(ax.pitch - gyro.calPitch);  // tilt forward = nose down
   }
   window.addEventListener('deviceorientation', onTilt);
   window.addEventListener('deviceorientationabsolute', onTilt);
@@ -168,7 +221,7 @@ function initGyro() {
       gyro.checkTimer = setTimeout(() => {
         if (gyro.on && gyro.lastData < enabledAt) {
           tiltBtn.classList.add('err');
-          toast('NO MOTION SENSOR DATA — allow "Motion sensors" in your browser’s site settings (Vanadium blocks them by default), then tap TILT again', 8000);
+          toast('NO MOTION SENSOR DATA — allow "Motion sensors" in your browser\u2019s site settings (Vanadium blocks them by default), then tap TILT again', 8000);
         }
       }, 1500);
     } else {
@@ -188,4 +241,5 @@ function initGyro() {
       setTilt(true);
     }
   });
+})();
 }

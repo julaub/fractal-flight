@@ -1,27 +1,30 @@
-// Ring course: spawning, pass-through detection, scoring, and packing the
-// ring data into the uniform arrays the shader expects.
-
-import { MAX_RINGS, START } from './config.js';
+import { START, MAX_RINGS, LAND_MIN_H } from './config.js';
 import { craft } from './state.js';
 import { normalize3, cross3 } from './math.js';
-import { terrainHeightJS } from './terrain.js';
+import { terrainShapeJ } from './terrain.js';
+import { ringSound } from './audio.js';
 
-const rings = [];
-let score = 0;
-
-const ringsPosData = new Float32Array(MAX_RINGS * 4);
-const ringsMatsData = new Float32Array(MAX_RINGS * 9);
-
-export function getScore() { return score; }
+// ============ RING COURSE (ported from jul's fractal-flight) ============
+// Fly through rings to score. Spawning chains ring-to-ring and fans its
+// candidate directions wider on retries so the course turns back over
+// mountains instead of drifting out to sea (jul's land-seeking fix).
+export const rings = [];
+let ringScore = 0;
+export const ringsPosData = new Float32Array(MAX_RINGS * 4);
+export const ringsMatsData = new Float32Array(MAX_RINGS * 9);
+const $ringScore = document.getElementById('ringScore');
+const $ringsBox = document.getElementById('rings-score');
 
 export function initRings() {
-  score = 0;
+  ringScore = 0;
+  $ringScore.textContent = 0;
+  prevPos = null;
   rings.length = 0;
   for (let i = 0; i < MAX_RINGS; i++) {
-    rings.push({ pos: [0,0,0], fwd: [0,0,1], right: [1,0,0], up: [0,1,0], radius: 18, active: false });
+    rings.push({ pos: [0,0,0], fwd: [0,0,1], right: [1,0,0], up: [0,1,0], radius: 18, active: false, behindT: 0 });
   }
   let lastPos = [START.x, START.y, START.z];
-  let lastFwd = [Math.sin(START.yaw) * Math.cos(START.pitch), Math.sin(START.pitch), Math.cos(START.yaw) * Math.cos(START.pitch)];
+  let lastFwd = [0, 0, 1];
   for (let i = 0; i < MAX_RINGS; i++) {
     spawnRing(i, lastPos, lastFwd);
     lastPos = rings[i].pos;
@@ -29,32 +32,26 @@ export function initRings() {
   }
 }
 
-const LAND_MIN_H = 30; // minimum terrain height (m) to anchor a ring over land
-
 function spawnRing(index, fromPos, fromFwd) {
-  // Try a fan of candidate directions: early attempts follow the chain
-  // heading, later ones swing wider so the course turns back over mountains
-  // instead of continuing out over water. If nothing clears LAND_MIN_H,
-  // fall back to the highest-terrain candidate seen.
+  // Fan of candidate directions: early attempts follow the chain heading,
+  // later ones swing wider; fall back to the highest terrain seen.
   const baseYaw = Math.atan2(fromFwd[0], fromFwd[2]);
   let best = null;
   for (let attempt = 0; attempt < 12; attempt++) {
-    const spread = 0.4 + 2.0 * attempt / 11; // total fan width in radians
+    const spread = 0.4 + 2.0 * attempt / 11;
     const yaw = baseYaw + (Math.random() - 0.5) * spread;
     const dist = 400 + Math.random() * 300;
     const x = fromPos[0] + Math.sin(yaw) * dist;
     const z = fromPos[2] + Math.cos(yaw) * dist;
-    const h = terrainHeightJS(x, z);
+    const h = terrainShapeJ(x, z);
     if (best === null || h > best.h) best = { x, z, h };
     if (h > LAND_MIN_H) { best = { x, z, h }; break; }
   }
 
-  // Place ring above terrain with generous clearance (100–220m above ground),
-  // with a minimum flying altitude
+  // Above terrain with generous clearance, and a minimum flying altitude
   const clearance = 100 + Math.random() * 120;
   const pos = [best.x, Math.max(best.h + clearance, 150), best.z];
 
-  // Orient ring to face the travel direction (from previous ring to this one)
   let fwd = normalize3([pos[0] - fromPos[0], pos[1] - fromPos[1], pos[2] - fromPos[2]]);
   let right = normalize3(cross3(fwd, [0, 1, 0]));
   if (!isFinite(right[0])) right = [1, 0, 0];
@@ -65,44 +62,72 @@ function spawnRing(index, fromPos, fromFwd) {
   rings[index].right = right;
   rings[index].up = up;
   rings[index].radius = 18;
+  rings[index].behindT = 0;
   rings[index].active = true;
 }
 
-// onScore is called once per collected ring (UI feedback lives in hud.js).
-export function updateRings(craftPos, craftFwd, onScore) {
+let prevPos = null;   // last frame's craft position, for the plane-crossing test
+
+export function updateRings(craftPos, craftFwd, dt) {
+  if (prevPos === null) prevPos = [craftPos[0], craftPos[1], craftPos[2]];
+  const segX = craftPos[0] - prevPos[0], segY = craftPos[1] - prevPos[1], segZ = craftPos[2] - prevPos[2];
+  const teleported = segX * segX + segY * segY + segZ * segZ > 400 * 400;   // R-reset jump: no false crossings
+
   for (let i = 0; i < MAX_RINGS; i++) {
     const r = rings[i];
     if (!r.active) continue;
 
-    const dx = r.pos[0] - craftPos[0];
-    const dy = r.pos[1] - craftPos[1];
-    const dz = r.pos[2] - craftPos[2];
-    const dist = Math.hypot(dx, dy, dz);
-
-    // Collision: close enough AND flying towards it
-    if (dist < r.radius * 0.8) {
-      const dot = (dx * craftFwd[0] + dy * craftFwd[1] + dz * craftFwd[2]) / Math.max(dist, 0.001);
-      if (dot > 0.3) {
-        score++;
-        r.active = false;
-        if (onScore) onScore();
-        spawnNextRing(i, craftPos);
+    // Pass detection (v6.0): the old test was a sphere around the ring CENTER
+    // (0.8 x radius) plus an approach-angle gate, so passes near the rim were
+    // missed. Now the frame's flight segment is intersected with the ring's
+    // PLANE: a crossing anywhere inside the full opening counts, at any
+    // speed, from any angle.
+    if (!teleported) {
+      const pz = (prevPos[0] - r.pos[0]) * r.fwd[0] + (prevPos[1] - r.pos[1]) * r.fwd[1] + (prevPos[2] - r.pos[2]) * r.fwd[2];
+      const cz = (craftPos[0] - r.pos[0]) * r.fwd[0] + (craftPos[1] - r.pos[1]) * r.fwd[1] + (craftPos[2] - r.pos[2]) * r.fwd[2];
+      if ((pz < 0) !== (cz < 0)) {
+        const t = pz / (pz - cz);   // where the segment crosses the ring plane
+        const hx = prevPos[0] + segX * t - r.pos[0];
+        const hy = prevPos[1] + segY * t - r.pos[1];
+        const hz = prevPos[2] + segZ * t - r.pos[2];
+        const rx = hx * r.right[0] + hy * r.right[1] + hz * r.right[2];
+        const ry = hx * r.up[0] + hy * r.up[1] + hz * r.up[2];
+        if (rx * rx + ry * ry <= r.radius * r.radius) {
+          ringScore++;
+          $ringScore.textContent = ringScore;
+          pulseRingScore();
+          ringSound();
+          r.active = false;
+          spawnNextRing(i, craftPos);
+          continue;
+        }
       }
     }
 
-    // Behind check: recycle if we've flown past it
+    // Behind housekeeping (v6.0): recycling used to be INSTANT — during a
+    // loop the forward vector reverses for a couple of seconds, every ring
+    // read as "behind", and the whole course respawned far away (the rings
+    // seemed to vanish). A ring must now stay behind for 4 continuous
+    // seconds, longer than any loop's reversed phase, before recycling.
     const behindDot = (r.pos[0] - craftPos[0]) * craftFwd[0] +
                       (r.pos[1] - craftPos[1]) * craftFwd[1] +
                       (r.pos[2] - craftPos[2]) * craftFwd[2];
     if (behindDot < -200) {
-      r.active = false;
-      spawnNextRing(i, craftPos);
+      r.behindT += dt;
+      if (r.behindT > 4.0) {
+        r.active = false;
+        spawnNextRing(i, craftPos);
+      }
+    } else {
+      r.behindT = 0;
     }
   }
+
+  prevPos[0] = craftPos[0]; prevPos[1] = craftPos[1]; prevPos[2] = craftPos[2];
 }
 
 function spawnNextRing(index, craftPos) {
-  // Find the furthest active ring to chain from
+  // Chain from the furthest active ring so the course keeps extending
   let furthestIdx = -1;
   let maxDistSq = -1;
   for (let j = 0; j < MAX_RINGS; j++) {
@@ -115,13 +140,13 @@ function spawnNextRing(index, craftPos) {
     }
   }
   if (furthestIdx === -1) {
-    spawnRing(index, craftPos, [Math.sin(craft.yaw), 0, Math.cos(craft.yaw)]);
+    const hf = normalize3([craft.f[0], 0, craft.f[2]]);
+    spawnRing(index, craftPos, isFinite(hf[0]) ? hf : [0, 0, 1]);
   } else {
     spawnRing(index, rings[furthestIdx].pos, rings[furthestIdx].fwd);
   }
 }
 
-// Fills and returns the uniform-ready arrays for the current frame.
 export function packRingData() {
   for (let i = 0; i < MAX_RINGS; i++) {
     const r = rings[i];
@@ -143,5 +168,9 @@ export function packRingData() {
       ringsPosData[i*4+3] = -1.0;
     }
   }
-  return { pos: ringsPosData, mats: ringsMatsData };
+}
+
+function pulseRingScore() {
+  $ringsBox.style.transform = 'translateX(-50%) scale(1.3)';
+  setTimeout(() => { $ringsBox.style.transform = 'translateX(-50%) scale(1)'; }, 150);
 }

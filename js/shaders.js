@@ -1,6 +1,4 @@
-// GLSL sources for the single fullscreen-triangle raymarching pass.
-// MB_CENTER / MB_SCALE must stay in sync with MB_* in config.js.
-
+// GLSL vertex + fragment shader sources.
 export const vsSrc = `#version 300 es
 in vec2 aPos;
 void main() { gl_Position = vec4(aPos, 0.0, 1.0); }`;
@@ -17,36 +15,85 @@ uniform float uFov;
 uniform vec2 uJitter;
 uniform float uPixScale;
 uniform vec3 uCraftPos;
+uniform vec3 uBulletPos[8];   // live tracer rounds; unused slots parked at y = -9999
+uniform vec3 uBombPos[3];     // falling bombs; unused slots parked at y = -9999
+uniform vec2 uBlastCell[64];  // xz centers of cells a detonation is querying (1e7 = idle)
+uniform vec4 uCloudPos[16];   // cumulonimbus: xyz center, w radius (v4.3)
+uniform float uCloudN;        // active cloud count
 uniform mat3 uCraftMat;
-uniform vec4 uRingsPos[8];
-uniform mat3 uRingMats[8];
+uniform vec4 uRingsPos[8];    // ring course (jul): xyz center, w radius (w<=0 = inactive)
+uniform mat3 uRingMats[8];    // ring orientation [right | up | fwd]
+uniform vec3 uLivery;         // craft accent color (nose / wingtips / fin), start-page picker
+// ---- live tuning knobs (bottom-left panel) ----
+uniform float uOceanSlope;   // how fast the sea floor drops away from land
+uniform float uOceanMax;     // max ocean depth below the noise floor
+uniform float uMassDecay;    // coast width: mountain mass falloff per meter
+uniform float uMountAmp;     // ridge amplitude
+uniform float uSnowLine;     // altitude where snow begins
+uniform float uFogDens;      // atmospheric fog density
+uniform vec2  uJuliaC;       // alien flora Julia-set parameter c
+uniform float uSnowFrac;     // target fraction of ranges tall enough for snow
+uniform float uFloraDens;    // 3D flora density (fraction of cells with a plant)
+uniform float uFloraRange;   // max distance at which 3D flora is marched
+uniform float uTreeSize;     // max plant size (m)
+uniform float uTreeShare;    // fern→tree balance (higher = more big trees)
+uniform float uTreeTiers;    // number of frond tiers up the plant
+uniform float uTreeFract;    // Julia-set modulation of the frond silhouette
+uniform sampler2D uCollected; // 512x512 bitmask of harvested plant cells (world wraps every ~13.3 km)
 
 out vec4 fragColor;
 
 const float WATER_LEVEL = -8.0;
-const float T_MAX = 9000.0;
+const float T_MAX = 22000.0;
 
+// ---------- hash & noise ----------
+// v4.5: Hoskins hash12. The old fract(p*(123.34,456.21)) hash had strong
+// row/column correlation — value noise inherited it as an axis-aligned
+// blocky grid no interpolant could hide. This one is decorrelated.
+// NOTE: continents/massifs are Mandelbrot-driven and unaffected; surface
+// detail (ridges, lakes, tree spots) re-rolls to a fresh variation.
 float hash(vec2 p) {
-  p = fract(p * vec2(123.34, 456.21));
-  p += dot(p, p + 45.32);
-  return fract(p.x * p.y);
+  vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+  p3 += dot(p3, p3.yzx + 33.33);
+  return fract((p3.x + p3.y) * p3.z);
 }
 float noise(vec2 p) {
   vec2 i = floor(p);
   vec2 f = fract(p);
-  f = f * f * (3.0 - 2.0 * f);
+  // quintic fade (C2): unlike the cubic, its 2nd derivative is continuous at
+  // cell borders, so lighting no longer picks up creases along the lattice.
+  // Lattice-point values are unchanged → the world layout is identical.
+  f = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
   float a = hash(i);
   float b = hash(i + vec2(1.0, 0.0));
   float c = hash(i + vec2(0.0, 1.0));
   float d = hash(i + vec2(1.0, 1.0));
   return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
 }
+// grid-hiding rotations (v4.2): OCT_ROT turns each fbmR octave ~37° so cell
+// borders never stack on the same axes; DECOR_ROT decorrelates decorative
+// (color/ripple) lattices from the terrain-shape lattice. Exact 3-4-5
+// rotation (0.8/0.6) — fp32-friendly.
+const mat2 OCT_ROT   = mat2(0.8,  0.6, -0.6, 0.8);
+const mat2 DECOR_ROT = mat2(0.8, -0.6,  0.6, 0.8);
 float fbm(vec2 p, int oct) {
   float v = 0.0, a = 0.5;
   for (int i = 0; i < 8; i++) {
     if (i >= oct) break;
     v += a * noise(p);
     p = p * 2.0 + vec2(13.7, 7.3);
+    a *= 0.5;
+  }
+  return v;
+}
+// rotated-octave fbm — DECORATIVE USE ONLY (clouds, color detail). Never for
+// terrainShape or its mirrors: rotating shape octaves would move the world.
+float fbmR(vec2 p, int oct) {
+  float v = 0.0, a = 0.5;
+  for (int i = 0; i < 8; i++) {
+    if (i >= oct) break;
+    v += a * noise(p);
+    p = OCT_ROT * p * 2.0 + vec2(13.7, 7.3);
     a *= 0.5;
   }
   return v;
@@ -68,12 +115,19 @@ float smin(float a, float b, float k) {
   float h = clamp(0.5 + 0.5 * (b - a) / k, 0.0, 1.0);
   return mix(b, a, h) - k * h * (1.0 - h);
 }
+// Smooth MAX — rounds the join where peaks meet the valley floor.
 float smax(float a, float b, float k) {
   return -smin(-a, -b, k);
 }
 
-const vec2  MB_CENTER = vec2(-0.55, 0.0);
-const float MB_SCALE  = 2.5e-4;
+// ---------- REAL Mandelbrot macro structure ----------
+// Escape-time iteration z -> z^2 + c over the world's xz plane, with the
+// analytic distance estimator DE = |z|·ln|z| / |z'|. Mountain ranges rise
+// where DE -> 0, i.e. they trace the actual coastline of the Mandelbrot set,
+// with its genuine self-similar bays, filaments and mini-brots.
+// ~26 complex mults is far cheaper than the old 26 gradient-noise evals.
+const vec2  MB_CENTER = vec2(-0.55, 0.0);   // which part of the set you fly over
+const float MB_SCALE  = 2.5e-4;             // world units -> complex plane (set spans ~12 km)
 
 float mandelDE(vec2 c, int maxIter) {
   vec2 z = vec2(0.0), dz = vec2(0.0);
@@ -85,62 +139,202 @@ float mandelDE(vec2 c, int maxIter) {
     m2 = dot(z, z);
     if (m2 > 1e6) break;
   }
-  if (m2 < 4.0) return 0.0;
+  if (m2 < 4.0) return 0.0;                          // inside the set → range core
   return sqrt(m2 / max(dot(dz, dz), 1e-12)) * 0.5 * log(m2);
 }
 
+// ---------- terrain shape ----------
+// Geometry is a fixed function of position (no camera-distance terms) — that's
+// what keeps summits rock-solid while flying.
+//
+// WORLD LAYOUT (all genuinely Mandelbrot):
+//  · Layer 1 = home island: the set's interior is the massif you spawn over;
+//    its coastline carries the ranges. Mini-brots & filaments around the set
+//    become island chains and islets in the ocean FOR FREE — e.g. the big
+//    period-3 mini-brot sits ~4.8 km west of spawn.
+//  · Layer 2 = mega-continent: the same set, zoomed out 2.5x, centered ~14 km
+//    north. Fly over open water and it rises on the horizon.
+//  · Noise shoals: far from both sets the sea floor undulates, so a few small
+//    random islets break the surface between the fractal ones.
+const vec2  MB2_CENTER = vec2(-0.55, 0.0);
+const float MB2_SCALE  = 1.0e-4;                 // 2.5x larger than home island
+const vec2  MB2_OFFSET = vec2(0.0, 14000.0);     // world position of continent core
+
+float worldDE(vec2 p, int it) {                  // distance-to-land in WORLD meters
+  float w1 = mandelDE(p * MB_SCALE + MB_CENTER, it) / MB_SCALE;
+  float w2 = mandelDE((p - MB2_OFFSET) * MB2_SCALE + MB2_CENTER, it) / MB2_SCALE;
+  return min(w1, w2);
+}
+
 float terrainShape(vec2 p) {
-  float de   = mandelDE(p * MB_SCALE + MB_CENTER, 26);
-  float mass = exp(-de * 14.0);
-  float baseElev = fbm(p * 0.0004, 3) * 90.0 - 12.0;
+  float wde  = worldDE(p, 26);
+  float mass = exp(-wde * uMassDecay);           // mountain mass hugs the coastlines
+
+  // Land near the sets, ocean floor sloping away from them
+  float baseElev = fbm(p * 0.0004, 3) * 70.0 + 4.0 - clamp(wde * uOceanSlope, 0.0, uOceanMax);
+
+  // Local alpine relief: light domain warp + FIXED 5 ridged octaves
   vec2 q  = vec2(fbm(p * 0.0009, 3), fbm(p * 0.0009 + vec2(5.2, 1.3), 3));
   vec2 pw = p + q * 60.0;
-  float mountain = (80.0 + 400.0 * ridged(pw * 0.0016, 5)) * mass;
+
+  // Per-massif height variability: a slow (~5 km) selector field decides which
+  // ranges are TALL (reach the snow line) vs modest. uSnowFrac slides the
+  // threshold so roughly that fraction of mountain area goes snowy.
+  float rangeSel = fbm(p * 0.00018, 2);
+  // Calibrated so P(selector > threshold) ~= uSnowFrac (empirical quantile fit
+  // of this fbm's value distribution): frac 0.2 -> th 0.28, 0.5 -> 0.17, 1 -> 0.
+  float tallTh   = 17.3 / (uSnowFrac + 6.44) - 2.32;
+  float tall     = smoothstep(tallTh - 0.05, tallTh + 0.05, rangeSel);
+  float ampScale = mix(0.42, 1.1, tall);   // modest ranges stay below the snow line; tall ones clear it
+
+  float mountain = (80.0 + uMountAmp * ridged(pw * 0.0016, 5)) * mass * ampScale;
+
+  // Rounded summits: smooth tanh saturation → domed peaks, no razor tips
   mountain = 460.0 * tanh(mountain / 460.0);
+  mountain -= 70.0 * (1.0 - mass);   // sink the term over open ocean so smax() lets the sea floor win
+
   float h = smax(baseElev, mountain, 45.0);
+
+  // Interior lakes: only on high ground (mass) and away from the peaks
   float valley = fbm(p * 0.0003 + 200.0, 3);
-  float lake   = smoothstep(0.55, 0.7, valley) * (1.0 - mass);
-  h = mix(h, -15.0, lake * 0.7);
+  float lake = smoothstep(0.58, 0.72, valley)
+             * smoothstep(0.4, 0.9, mass)
+             * (1.0 - smoothstep(30.0, 80.0, mountain));
+  h = mix(h, -15.0, lake * 0.65);
   return h;
 }
 
+// Cheap variant for shadow rays: fewer iterations, 2 noise octaves.
 float terrainCheapH(vec2 p) {
-  float de   = mandelDE(p * MB_SCALE + MB_CENTER, 14);
-  float mass = exp(-de * 14.0);
-  float mountain = (80.0 + 400.0 * ridged(p * 0.0016, 2)) * mass;
-  mountain = 460.0 * tanh(mountain / 460.0);
-  return smax(fbm(p * 0.0004, 2) * 90.0 - 12.0, mountain, 45.0);
+  float wde  = worldDE(p, 13);
+  float mass = exp(-wde * uMassDecay);
+  float tallTh = 17.3 / (uSnowFrac + 6.44) - 2.32;
+  float tall = smoothstep(tallTh - 0.05, tallTh + 0.05, fbm(p * 0.00018, 2));
+  float mountain = (80.0 + uMountAmp * ridged(p * 0.0016, 2)) * mass * mix(0.42, 1.1, tall);
+  mountain = 460.0 * tanh(mountain / 460.0) - 70.0 * (1.0 - mass);
+  float base = fbm(p * 0.0004, 2) * 70.0 + 4.0 - clamp(wde * uOceanSlope, 0.0, uOceanMax);
+  return smax(base, mountain, 45.0);
+}
+
+// ---------- 3D alien fern flora ----------
+// Real geometry, folded into the main terrain march. Each 26 m ground cell may
+// host one plant: a tiered, scalloped cone silhouette — fern (1.6 m) up to
+// tree (13 m), size^2.4-biased so ferns are common and trees rare.
+// The trick that keeps it nearly FREE: the plant is anchored using dTerr, the
+// height-above-terrain the march has ALREADY computed this step, so no extra
+// terrain evaluations. Rays cruising above the canopy reject in one compare.
+const float FCELL = 26.0;
+// returns vec3(conservative distance, cell random, normalized height on plant)
+vec3 plantEval(vec3 p, float dTerr, float mt) {
+  // mt = march distance to this sample (0 for collision probes).
+  // mt < 550: full silhouette (fronds + Julia carve). Beyond: mean-envelope
+  // LOD — and (v4.6) EXAGGERATED PERSPECTIVE: the tree's size itself shrinks
+  // with distance, down to 35% at 4 km, so far groves read as tiny specks
+  // that visibly grow on approach. Probes pass mt = 0 → collision unchanged.
+  float hg = p.y - dTerr;                          // ground height in this column
+  vec2 cell = floor(p.xz / FCELL);
+  float rnd = hash(cell);
+  if (rnd > uFloraDens || hg < 5.0 || hg > 140.0) return vec3(1e5, 0.0, 0.0); // greenbelt only
+  // harvested plants are gone — one texel per cell
+  if (texelFetch(uCollected, ivec2(mod(cell, 512.0)), 0).r > 0.5) return vec3(1e5, 0.0, 0.0);
+  float s = mix(1.6, uTreeSize, pow(hash(cell + 51.0), mix(5.0, 1.2, uTreeShare))); // fern → tree
+  s *= mix(1.0, 0.35, smoothstep(550.0, 4000.0, mt));   // distance shrink (visual only)
+  vec2 ctr = (cell + 0.5) * FCELL + (vec2(hash(cell + 13.0), hash(cell + 37.0)) - 0.5) * 12.0;
+  float ly = dTerr;                                // height above ground
+  float yn = clamp(ly / s, 0.0, 1.0);
+  vec2 d2 = p.xz - ctr;
+  float crown  = pow(sin(clamp((yn - 0.30) / 0.70, 0.0, 1.0) * 3.14159), 0.8);
+  if (mt >= 550.0) {
+    // far LOD: frond-less mean envelope, no trig, no Julia
+    float Rf = s * (0.045 + 0.46 * crown * 0.72);
+    float df = max(length(d2) - Rf, ly - s);
+    return vec3(df * 0.45, rnd, yn);
+  }
+  // ALIEN TREE-FERN silhouette (v1.6): slim bare stalk, then a crown of
+  // arched fronds that flares widest around 3/4 height and folds back in at
+  // the tip — the inverse of a pine. uTreeTiers = number of fronds around
+  // the axis, with a slight spiral twist up the stalk.
+  float az     = atan(d2.y, d2.x);
+  float azFade = clamp(length(d2) / (0.35 * s), 0.0, 1.0);  // Lipschitz: no angular chop near the axis
+  float lobes  = 0.45 + 0.55 * abs(sin(az * (uTreeTiers * 0.5) + rnd * 6.28 + yn * 2.2));
+  float fronds = mix(1.0, lobes, azFade);
+  float R = s * (0.045 + 0.46 * crown * fronds);
+  // v1.5: GENUINE fractal fronds — a small Julia iteration (z -> z^2 + c,
+  // same c as the undergrowth, so the flora knobs shape both) sampled in the
+  // (height, azimuth) plane carves the silhouette into self-similar lobes.
+  if (uTreeFract > 0.001 && R > 0.05) {
+    vec2 zj = vec2(yn * 2.0 - 1.0, az * 0.318);
+    float fj = 0.0;
+    for (int i = 0; i < 5; i++) {
+      zj = vec2(zj.x * zj.x - zj.y * zj.y, 2.0 * zj.x * zj.y) + uJuliaC;
+      if (dot(zj, zj) > 9.0) break;
+      fj += 0.2;
+    }
+    R *= mix(1.0, 0.6 + 0.8 * fj, uTreeFract);
+  }
+  float d = max(length(d2) - R, ly - s);
+  return vec3(d * 0.45, rnd, yn);                  // 0.45 = Lipschitz margin for the fractal scallops
+}
+
+// ---------- alien Mandelbrot flora (2D undergrowth pattern) ----------
+// Each ~42 m cell of the greenbelt hosts one dendritic JULIA growth
+// (z -> z^2 + c with c near the set's boundary → branching, fern-like
+// filaments). Per-cell hash rotates the plant and perturbs c so no two
+// growths are identical. Shading only — zero geometry cost.
+float alienFlora(vec2 p) {
+  vec2 cell = floor(p / 42.0);
+  vec2 uv = (fract(p / 42.0) - 0.5) * 3.4;
+  float rot = hash(cell) * 6.2831;
+  float cs = cos(rot), sn = sin(rot);
+  uv = mat2(cs, -sn, sn, cs) * uv;
+  vec2 c = uJuliaC + vec2(hash(cell + 3.0) * 0.05, hash(cell + 7.0) * 0.07);
+  vec2 z = uv;
+  float it = 0.0;
+  for (int i = 0; i < 11; i++) {
+    z = vec2(z.x * z.x - z.y * z.y, 2.0 * z.x * z.y) + c;
+    if (dot(z, z) > 16.0) break;
+    it += 1.0;
+  }
+  return it / 11.0;   // → 1 on the Julia filaments = the "plant"
 }
 
 vec3 terrainColor(vec3 pos, vec3 normal, float h, float pixelSize) {
   float slope = 1.0 - normal.y;
-  float snowAmt = smoothstep(35.0, 70.0, h) * (1.0 - smoothstep(0.4, 0.7, slope));
-  snowAmt *= 0.7 + 0.3 * noise(pos.xz * 0.08);
-  float rockAmt = smoothstep(0.4, 0.7, slope);
-  vec3 rockCol = mix(vec3(0.30, 0.24, 0.19), vec3(0.44, 0.39, 0.34), noise(pos.xz * 0.03));
-  float forestAmt = smoothstep(0.0, 30.0, h) * smoothstep(70.0, 30.0, h) * (1.0 - smoothstep(0.5, 0.8, slope));
-  vec3 forestCol = vec3(0.05, 0.14, 0.05);
-  if (pixelSize < 3.0) {
-    float tn = noise(pos.xz * 1.2);
-    forestCol = mix(forestCol, vec3(0.02, 0.08, 0.02), tn);
-    float tn2 = noise(pos.xz * 3.5 + 50.0);
-    forestCol = mix(forestCol, vec3(0.13, 0.24, 0.11), tn2 * 0.5);
+
+  // ---- strict altitude bands: sand → vegetation → rock → snow ----
+  float sandAmt = 1.0 - smoothstep(3.0, 12.0, h);                         // shoreline
+  float vegAmt  = smoothstep(4.0, 16.0, h) * (1.0 - smoothstep(95.0, 145.0, h));
+  float rockAmt = smoothstep(95.0, 145.0, h) * (1.0 - smoothstep(uSnowLine, uSnowLine + 50.0, h));
+  float snowAmt = smoothstep(uSnowLine, uSnowLine + 50.0, h);                            // tops only
+  // slope corrections: cliffs are bare rock at any altitude; snow clings to flatter tops
+  float cliff = smoothstep(0.5, 0.78, slope);
+  snowAmt *= 1.0 - smoothstep(0.32, 0.58, slope);
+  snowAmt *= 0.75 + 0.25 * noise(DECOR_ROT * pos.xz * 0.08);              // fractal snow edge
+
+  vec3 sandCol = mix(vec3(0.62, 0.55, 0.40), vec3(0.70, 0.64, 0.48), noise(DECOR_ROT * pos.xz * 0.15));
+
+  // vegetation: lush greens + alien Julia flora
+  vec3 vegCol = mix(vec3(0.12, 0.28, 0.09), vec3(0.18, 0.36, 0.12), noise(DECOR_ROT * pos.xz * 0.6));
+  if (pixelSize < 5.0) {
+    float fl = alienFlora(pos.xz);
+    vec3 alien = mix(vec3(0.04, 0.20, 0.10), vec3(0.10, 0.46, 0.30), fl);
+    alien += vec3(0.06, 0.34, 0.26) * smoothstep(0.78, 1.0, fl);          // luminous vein tips
+    vegCol = mix(vegCol, alien, smoothstep(0.30, 0.85, fl) * (1.0 - smoothstep(3.0, 5.0, pixelSize)));
   }
-  vec3 grassCol = vec3(0.17, 0.27, 0.08);
-  if (pixelSize < 1.0) {
-    grassCol = mix(grassCol, vec3(0.24, 0.34, 0.12), noise(pos.xz * 0.8));
-  }
-  float shoreAmt = smoothstep(-5.0, 5.0, h) * (1.0 - smoothstep(5.0, 15.0, h));
-  vec3 shoreCol = vec3(0.55, 0.50, 0.38);
-  vec3 col = grassCol;
-  col = mix(col, forestCol, forestAmt);
-  col = mix(col, rockCol, rockAmt);
-  col = mix(col, shoreCol, shoreAmt * (1.0 - rockAmt) * (1.0 - forestAmt));
+
+  vec3 rockCol = mix(vec3(0.33, 0.25, 0.18), vec3(0.48, 0.40, 0.32), noise(DECOR_ROT * pos.xz * 0.03));
+  rockCol = mix(rockCol, vec3(0.40, 0.34, 0.28), fbmR(pos.xz * 0.15, 3) * 0.6); // strata
+
+  // assemble by altitude, then slope overrides, then snow on top
+  vec3 col = sandCol;
+  col = mix(col, vegCol, vegAmt);
+  col = mix(col, rockCol, max(rockAmt, cliff * smoothstep(6.0, 20.0, h)));
   vec3 snowCol = mix(vec3(0.80, 0.85, 0.94), vec3(0.96, 0.97, 1.0), normal.y);
   col = mix(col, snowCol, snowAmt);
   return col;
 }
 
+// ---------- terrain normal (footprint-matched epsilon = stable shading) ----------
 vec3 terrainNormal(vec2 p, float pixelSize) {
   float e = max(0.4 * pixelSize, 0.15);
   float hL = terrainShape(p - vec2(e, 0.0));
@@ -150,67 +344,167 @@ vec3 terrainNormal(vec2 p, float pixelSize) {
   return normalize(vec3(hL - hR, 2.0 * e, hD - hU));
 }
 
-float marchTerrain(vec3 ro, vec3 rd) {
+// ---------- terrain raymarch (sphere-traced heightfield + linear refine) ----------
+// returns vec2(t, material): material 1 = terrain, 4 = plant, t<0 = miss
+vec2 marchTerrain(vec3 ro, vec3 rd) {
   float t = 0.5;
   float pt = t, pd = 1e5;
   for (int i = 0; i < 150; i++) {
     vec3 p = ro + rd * t;
-    if (p.y > 560.0 && rd.y > 0.0) return -1.0;
-    float d = p.y - terrainShape(p.xz);
-    if (d < 0.01 + 0.0015 * t) {
+    if (p.y > 560.0 && rd.y > 0.0) return vec2(-1.0, 0.0); // above the tallest peak, heading up
+    float dT = p.y - terrainShape(p.xz);
+    // 3D flora: only evaluated when the ray is close AND skimming near the
+    // ground — cruising altitude pays a single compare per step.
+    float dP = 1e5;
+    if (t < uFloraRange && dT < 18.0 && dT > -1.0) dP = plantEval(p, dT, t).x;
+    float d = min(dT * 0.55, dP);   // relaxed terrain stride, cautious near plants
+    if (min(dT, dP) < 0.01 + 0.0015 * t) {
       float w = clamp(pd / (pd - d), 0.0, 1.0);
-      return mix(pt, t, w);
+      return vec2(mix(pt, t, w), (dP < dT) ? 4.0 : 1.0);
     }
     pt = t; pd = d;
-    t += d * 0.55 + t * 0.0018;
+    t += d + t * 0.0018;
     if (t > T_MAX) break;
   }
-  return -1.0;
+  return vec2(-1.0, 0.0);
 }
 
+// ---------- soft sun shadow (coarse LOD terrain → cheap & stable) ----------
 float softShadow(vec3 ro, vec3 rd) {
   float res = 1.0;
   float t = 4.0;
-  for (int i = 0; i < 24; i++) {
+  for (int i = 0; i < 24; i++) {           // was 40
     vec3 p = ro + rd * t;
     if (p.y > 560.0) break;
-    float h = p.y - terrainCheapH(p.xz);
+    float h = p.y - terrainCheapH(p.xz);   // cheap 2-octave terrain for shadows
     res = min(res, 5.0 * h / t);
     if (res < 0.01) break;
-    t += clamp(h, 6.0, 90.0);
+    t += clamp(h, 6.0, 90.0);              // longer strides
   }
   return clamp(res, 0.0, 1.0);
 }
 
+// ---------- sky, sun, clouds ----------
+// ---------- golden hour ----------
+// As the sun approaches the horizon everything shifts to a California-sunset
+// palette: deep orange horizon band, purple-blue zenith, reddened sunlight,
+// warm fog, pink clouds. duskAmount goes 0 (day) → 1 (sun on the horizon).
+float duskAmount(vec3 sun) { return 1.0 - smoothstep(0.06, 0.34, sun.y); }
+vec3 sunLightCol(vec3 sun) { return mix(vec3(1.30, 1.02, 0.78), vec3(1.55, 0.55, 0.25), duskAmount(sun)); }
+vec3 skyAmbCol(vec3 sun)   { return mix(vec3(0.42, 0.56, 0.82), vec3(0.46, 0.36, 0.52), duskAmount(sun)); }
+
 vec3 skyColor(vec3 rd, vec3 sun) {
   float sd = clamp(dot(rd, sun), 0.0, 1.0);
+  float dusk = duskAmount(sun);
   float horiz = 1.0 - smoothstep(0.0, 0.45, rd.y);
-  vec3 col = mix(vec3(0.62, 0.70, 0.84), vec3(0.10, 0.24, 0.48), smoothstep(-0.05, 0.55, rd.y));
-  col = mix(col, vec3(1.00, 0.58, 0.28), pow(sd, 5.0) * horiz * 0.75);
-  col += vec3(1.00, 0.72, 0.42) * pow(sd, 48.0) * 0.55;
-  col += vec3(1.00, 0.88, 0.65) * pow(sd, 900.0) * 3.0;
+  vec3 horCol = mix(vec3(0.62, 0.70, 0.84), vec3(0.96, 0.44, 0.22), dusk);
+  vec3 zenCol = mix(vec3(0.10, 0.24, 0.48), vec3(0.09, 0.10, 0.30), dusk);
+  vec3 col = mix(horCol, zenCol, smoothstep(-0.05, 0.55, rd.y));
+  // warm band around the low sun — widens and reddens at dusk
+  vec3 band = mix(vec3(1.00, 0.58, 0.28), vec3(1.05, 0.30, 0.10), dusk);
+  col = mix(col, band, pow(sd, mix(5.0, 2.6, dusk)) * horiz * mix(0.75, 0.95, dusk));
+  col += mix(vec3(1.00, 0.72, 0.42), vec3(1.10, 0.42, 0.16), dusk) * pow(sd, 48.0) * 0.55;   // glow
+  col += mix(vec3(1.00, 0.88, 0.65), vec3(1.05, 0.52, 0.28), dusk) * pow(sd, 900.0) * 3.0;   // disc
+  // thin high clouds — lit pink from below at dusk
   if (rd.y > 0.015) {
     vec2 cuv = rd.xz / (rd.y + 0.18) * 1.4;
-    float cl = fbm(cuv * 2.0 + vec2(uTime * 0.012, 0.0), 5);
+    float cl = fbmR(DECOR_ROT * (cuv * 2.0 + vec2(uTime * 0.012, 0.0)), 5);   // rotated 1st octave too
     float cm = smoothstep(0.52, 0.82, cl) * smoothstep(0.015, 0.16, rd.y);
     vec3 cc = mix(vec3(0.92, 0.93, 0.95), vec3(1.0, 0.82, 0.62), pow(sd, 3.0));
+    cc = mix(cc, vec3(1.0, 0.58, 0.48), dusk * 0.7);
     col = mix(col, cc, cm * 0.65);
   }
   return col;
 }
 
+// ---------- height-weighted valley fog ----------
 float fogFactor(vec3 ro, vec3 rd, float t) {
   float midY = max(ro.y + rd.y * t * 0.5, 0.0);
   float hf = exp(-midY * 0.004);
-  return 1.0 - exp(-t * 0.00045 * (0.30 + hf));
+  return 1.0 - exp(-t * uFogDens * (0.26 + hf));
 }
 vec3 applyFog(vec3 col, vec3 ro, vec3 rd, float t, vec3 sun) {
   float f = fogFactor(ro, rd, t);
   float sd = clamp(dot(rd, sun), 0.0, 1.0);
-  vec3 fcol = mix(vec3(0.58, 0.65, 0.78), vec3(1.0, 0.70, 0.40), pow(sd, 6.0));
+  float dusk = duskAmount(sun);
+  vec3 fbase = mix(vec3(0.58, 0.65, 0.78), vec3(0.72, 0.48, 0.44), dusk);
+  vec3 fwarm = mix(vec3(1.0, 0.70, 0.40), vec3(1.05, 0.42, 0.20), dusk);
+  vec3 fcol = mix(fbase, fwarm, pow(sd, 6.0));
   return mix(col, fcol, f);
 }
 
+// ---------- cumulonimbus (v4.3, lobed v4.4) ----------
+// Each cloud is now a CLUSTER: one broad flat slab (the dark base) plus four
+// cauliflower bubbles on top, placed by per-cloud hashes. A single bounding
+// sphere gates the whole cluster, so rays that miss the cloud still pay just
+// one quadratic; only rays inside test the 5 lobes and only hit lobes pay
+// for noise. A hard smoothstep shelf flattens the underside — the classic
+// anvil-bottom look. Clouds remain pure visuals: no collision, bullets and
+// bombs pass straight through. Orderless accumulation as before.
+vec4 cloudLayer(vec3 ro, vec3 rd, float tMax, vec3 sun) {
+  float trans = 1.0, sumA = 0.0;
+  vec3 sumC = vec3(0.0);
+  for (int i = 0; i < 16; i++) {
+    if (float(i) >= uCloudN) break;
+    vec3 c = uCloudPos[i].xyz;
+    float r = uCloudPos[i].w;
+    // bounding sphere: one cheap test hides the whole cluster
+    vec3 oc = ro - c;
+    float bb = dot(oc, rd);
+    float cc = dot(oc, oc) - 1.9 * r * r;        // radius 1.38r
+    if (bb * bb - cc < 0.0) continue;
+    if (bb > 0.0 && cc > 0.0) continue;          // cluster fully behind the ray
+    float fi = float(i);
+    for (int L = 0; L < 5; L++) {
+      vec3 lc; vec3 ls;
+      if (L == 0) {                              // broad flat base slab
+        lc = c;
+        ls = vec3(r, r * 0.38, r);
+      } else {                                   // cauliflower bubble on top
+        float fL = float(L);
+        float a1 = hash(vec2(fi * 7.13, fL * 3.71)) * 6.2831;
+        float rr = (0.12 + 0.38 * hash(vec2(fi * 2.17, fL * 5.31))) * r;
+        float br = (0.30 + 0.22 * hash(vec2(fi * 4.91, fL * 1.77))) * r;
+        lc = c + vec3(cos(a1) * rr,
+                      r * 0.16 + br * 0.55 + hash(vec2(fi + 0.7, fL)) * 0.22 * r,
+                      sin(a1) * rr);
+        ls = vec3(br, br * 0.92, br);
+      }
+      vec3 o = (ro - lc) / ls;
+      vec3 d = rd / ls;
+      float A = dot(d, d), B = dot(o, d), C = dot(o, o) - 1.0;
+      float disc = B * B - A * C;
+      if (disc <= 0.0) continue;
+      float sq = sqrt(disc);
+      float t0 = max((-B - sq) / A, 0.0);
+      float t1 = min((-B + sq) / A, tMax);
+      if (t1 <= t0) continue;
+      float tm = 0.5 * (t0 + t1);
+      vec3 pm = ro + rd * tm;
+      // puffy erosion: world-anchored → drifting clouds slowly billow
+      float e = fbmR((pm.xz + pm.y * 0.8) * (2.9 / r) + vec2(fi * 17.31, fi * 9.7), 3);
+      float depth = (t1 - t0) / max(ls.x, 1.0);
+      float dens = smoothstep(0.05, 0.80, depth * 0.60)
+                 * smoothstep(0.32, 0.70, e + depth * 0.22);
+      dens *= smoothstep(c.y - 0.52 * r, c.y - 0.30 * r, pm.y);   // FLAT underside shelf
+      if (dens < 0.004) continue;
+      // shade: dark flat base → bright bubbly top, dusk-warmed, silver lining
+      float hIn = clamp((pm.y - (c.y - 0.40 * r)) / (1.5 * r), 0.0, 1.0);
+      vec3 shade = mix(vec3(0.44, 0.47, 0.55), vec3(1.05, 1.03, 0.99), hIn);
+      shade *= mix(vec3(1.0), sunLightCol(sun) * 0.78, 0.5);
+      shade += vec3(1.0, 0.85, 0.65) * pow(clamp(dot(rd, sun), 0.0, 1.0), 10.0) * 0.35;
+      shade = applyFog(shade, ro, rd, tm, sun);  // distant clouds sink into haze
+      float a = dens * 0.82;
+      sumC += shade * a;
+      sumA += a;
+      trans *= 1.0 - a;
+    }
+  }
+  if (sumA < 1e-4) return vec4(0.0);
+  return vec4(sumC / sumA, 1.0 - trans);
+}
+
+// ---------- chase aircraft (SDF, rendered in the same scene) ----------
 float sdBox(vec3 p, vec3 b) {
   vec3 q = abs(p) - b;
   return length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0);
@@ -220,27 +514,29 @@ float sdEll(vec3 p, vec3 r) {
   float k1 = length(p / (r * r));
   return k0 * (k0 - 1.0) / max(k1, 1e-5);
 }
+// Local frame: +z = nose, +y = up, +x = right wing
 float sdCraft(vec3 p) {
-  float d = sdEll(p, vec3(0.50, 0.42, 2.30));
-  d = min(d, sdEll(p - vec3(0.0, 0.30, 0.55), vec3(0.28, 0.24, 0.72)));
+  float d = sdEll(p, vec3(0.50, 0.42, 2.30));                              // fuselage
+  d = min(d, sdEll(p - vec3(0.0, 0.30, 0.55), vec3(0.28, 0.24, 0.72)));    // canopy
   vec3 w = p - vec3(0.0, -0.05, 0.25);
-  w.z += abs(w.x) * 0.28;
-  d = min(d, sdBox(w, vec3(3.10, 0.05, 0.52 - abs(w.x) * 0.06)));
+  w.z += abs(w.x) * 0.28;                                                   // wing sweep
+  d = min(d, sdBox(w, vec3(3.10, 0.05, 0.52 - abs(w.x) * 0.06)));          // wings
   vec3 tp = p - vec3(0.0, 0.06, -2.00);
   tp.z += abs(tp.x) * 0.32;
-  d = min(d, sdBox(tp, vec3(1.05, 0.04, 0.30)));
+  d = min(d, sdBox(tp, vec3(1.05, 0.04, 0.30)));                            // tailplane
   vec3 f = p - vec3(0.0, 0.45, -2.05);
   f.z += f.y * 0.55;
-  d = min(d, sdBox(f, vec3(0.04, 0.52, 0.32)));
+  d = min(d, sdBox(f, vec3(0.04, 0.52, 0.32)));                             // fin
   return d;
 }
 vec3 toCraftLocal(vec3 wp) {
   return transpose(uCraftMat) * (wp - uCraftPos);
 }
 float marchCraft(vec3 ro, vec3 rd) {
+  // bounding sphere first — skip the SDF entirely for most rays
   vec3 oc = ro - uCraftPos;
   float b = dot(oc, rd);
-  float c = dot(oc, oc) - 22.0;
+  float c = dot(oc, oc) - 22.0;   // r ≈ 4.7
   float disc = b * b - c;
   if (disc < 0.0) return -1.0;
   float sq = sqrt(disc);
@@ -266,6 +562,8 @@ vec3 craftNormal(vec3 wp) {
   return uCraftMat * n;
 }
 
+// ---------- score rings (ported from jul's fractal-flight) ----------
+// Torus in the ring's local frame, axis along local z (the fly-through axis).
 float sdTorusZ(vec3 p, float r, float th) {
   vec2 q = vec2(length(p.xy) - r, p.z);
   return length(q) - th;
@@ -321,78 +619,141 @@ vec3 ringNormal(vec3 wp) {
   return normal;
 }
 
+// probe payload encoders: height → 24-bit fixed point over [-80, 560],
+// plant distance → 8 bits over [0, 40] m
+vec4 encodeHeight(float gh) {
+  float nn = clamp((gh + 80.0) / 640.0, 0.0, 1.0);
+  float v = floor(nn * 16777215.0);
+  return vec4(floor(v / 65536.0), floor(mod(v, 65536.0) / 256.0), mod(v, 256.0), 255.0) / 255.0;
+}
+vec4 encodePlantD(float dP) {
+  return vec4(vec3(clamp(dP / 40.0, 0.0, 1.0)), 1.0);
+}
+
 void main() {
+  // ---- collision probe (v1.5, widened v3.2/v3.3) ----
+  // The bottom-left pixel row doesn't render the scene; it encodes, in the
+  // SAME fp32 math that draws the world, answers for JS collision queries:
+  //   px 0-1        terrain height / plant distance at the craft
+  //   px 2+2i, 3+2i terrain height / plant distance at bullet slot i (8 slots)
+  //   px 18..81     plant distance at blast-query cell j (bomb detonations)
+  //   px 82..84     terrain height at bomb slot k (3 slots)
+  // JS reads the row back each frame in one readPixels, so all collision
+  // agrees with the rendered geometry bit-for-bit.
+  if (gl_FragCoord.y < 1.0 && gl_FragCoord.x < 85.0) {
+    int px = int(gl_FragCoord.x);
+    if (px < 18) {
+      vec3 pp = (px < 2) ? uCraftPos : uBulletPos[(px - 2) / 2];
+      float gh = terrainShape(pp.xz);
+      bool wantGround = (px < 2) ? (px == 0) : ((px - 2) % 2 == 0);
+      if (wantGround) fragColor = encodeHeight(gh);
+      else            fragColor = encodePlantD(plantEval(pp, pp.y - gh, 0.0).x / 0.45);
+    } else if (px < 82) {
+      // does this cell hold a living tree? probe 4 m above its own ground
+      vec2 c = uBlastCell[px - 18];
+      float gh = terrainShape(c);
+      fragColor = encodePlantD(plantEval(vec3(c.x, gh + 4.0, c.y), 4.0, 0.0).x / 0.45);
+    } else {
+      fragColor = encodeHeight(terrainShape(uBombPos[px - 82].xz));
+    }
+    return;
+  }
   vec2 uv = (2.0 * (gl_FragCoord.xy + uJitter) - uResolution) / uResolution.y;
   vec3 ro = uCamPos;
   vec3 rd = normalize(uCamMat * vec3(uv * uFov, 1.0));
   vec3 sun = normalize(uSunDir);
 
-  float tT = marchTerrain(ro, rd);
+  vec2 mres = marchTerrain(ro, rd);
+  float tT = mres.x;
   float tW = (rd.y < -1e-4 && ro.y > WATER_LEVEL) ? (WATER_LEVEL - ro.y) / rd.y : -1.0;
   float tC = marchCraft(ro, rd);
   float tR = marchRings(ro, rd);
 
   float t = T_MAX;
-  int mat = 0;
-  if (tT > 0.0 && tT < t) { t = tT; mat = 1; }
-  if (tW > 0.0 && tW < t) { t = tW; mat = 2; }
-  if (tC > 0.0 && tC < t) { t = tC; mat = 3; }
-  if (tR > 0.0 && tR < t) { t = tR; mat = 4; }
+  int mat = 0;                                              // 0 sky
+  if (tT > 0.0 && tT < t) { t = tT; mat = int(mres.y); }    // 1 terrain / 4 plant
+  if (tW > 0.0 && tW < t) { t = tW; mat = 2; }              // water
+  if (tC > 0.0 && tC < t) { t = tC; mat = 3; }              // aircraft
+  if (tR > 0.0 && tR < t) { t = tR; mat = 5; }              // score ring
 
   vec3 col;
 
   if (mat == 0) {
     col = skyColor(rd, sun);
+
   } else if (mat == 1) {
     vec3 pos = ro + rd * t;
     float px = t * uPixScale;
     vec3 n = terrainNormal(pos.xz, px);
     vec3 alb = terrainColor(pos, n, pos.y, px);
     float ndl = clamp(dot(n, sun), 0.0, 1.0);
-    float sh = (ndl > 0.02) ? softShadow(pos + n * 1.0, sun) : 0.0;
+    float sh = (ndl > 0.02) ? softShadow(pos + n * 1.0, sun) : 0.0; // skip shadow ray on sun-averted slopes
     float dif = ndl * sh;
     float skyA = clamp(0.5 + 0.5 * n.y, 0.0, 1.0);
     float bnc = clamp(dot(n, normalize(vec3(-sun.x, 0.0, -sun.z))), 0.0, 1.0);
-    vec3 lin = vec3(1.30, 1.02, 0.78) * 2.3 * dif
-             + vec3(0.42, 0.56, 0.82) * 0.50 * skyA
+    vec3 lin = sunLightCol(sun) * 2.3 * dif
+             + skyAmbCol(sun) * 0.50 * skyA
              + vec3(0.90, 0.60, 0.40) * 0.12 * bnc;
     col = alb * lin;
-    float snowy = smoothstep(35.0, 70.0, pos.y) * n.y;
+    // low-sun sparkle on snow
+    float snowy = smoothstep(uSnowLine, uSnowLine + 50.0, pos.y) * n.y;
     vec3 hlf = normalize(sun - rd);
     col += vec3(1.0, 0.9, 0.7) * pow(clamp(dot(n, hlf), 0.0, 1.0), 48.0) * snowy * sh * 0.6;
     col = applyFog(col, ro, rd, t, sun);
+
   } else if (mat == 2) {
     vec3 pos = ro + rd * t;
     float bed = terrainShape(pos.xz);
     float depth = clamp((WATER_LEVEL - bed) / 8.0, 0.0, 1.0);
-    float w0 = noise(pos.xz * 0.12 + uTime * 0.25);
-    float wx = noise(pos.xz * 0.12 + vec2(0.6, 0.0) + uTime * 0.25) - w0;
-    float wz = noise(pos.xz * 0.12 + vec2(0.0, 0.6) + uTime * 0.25) - w0;
+    // small animated ripples (rotated domain: wavelets off the world axes)
+    vec2 wp = DECOR_ROT * pos.xz * 0.12;
+    float w0 = noise(wp + uTime * 0.25);
+    float wx = noise(wp + vec2(0.6, 0.0) + uTime * 0.25) - w0;
+    float wz = noise(wp + vec2(0.0, 0.6) + uTime * 0.25) - w0;
     vec3 n = normalize(vec3(-wx * 1.6, 1.0, -wz * 1.6));
     vec3 rr = reflect(rd, n);
     rr.y = abs(rr.y);
     vec3 refl = skyColor(rr, sun);
     float fres = 0.03 + 0.97 * pow(1.0 - clamp(dot(-rd, n), 0.0, 1.0), 5.0);
-    vec3 base = mix(vec3(0.10, 0.30, 0.28), vec3(0.02, 0.10, 0.13), depth);
+    vec3 base = mix(vec3(0.10, 0.30, 0.28), vec3(0.02, 0.10, 0.13), depth); // glacial teal
     float sh = softShadow(pos + vec3(0.0, 0.5, 0.0), sun);
     col = mix(base, refl, fres);
-    col += vec3(1.0, 0.80, 0.50) * pow(clamp(dot(rr, sun), 0.0, 1.0), 260.0) * 3.0 * fres * sh;
+    vec3 glint = mix(vec3(1.0, 0.80, 0.50), vec3(1.1, 0.45, 0.20), duskAmount(sun));
+    col += glint * pow(clamp(dot(rr, sun), 0.0, 1.0), 260.0) * 3.0 * fres * sh;
     col = applyFog(col, ro, rd, t, sun);
-  } else if (mat == 3) {
-    vec3 pos = ro + rd * t;
-    vec3 n = craftNormal(pos);
-    vec3 lp = toCraftLocal(pos);
-    vec3 alb = vec3(0.88, 0.89, 0.92);
-    float red = clamp(step(1.65, lp.z) + step(2.55, abs(lp.x)) + ((lp.y > 0.35 && lp.z < -1.6) ? 1.0 : 0.0), 0.0, 1.0);
-    alb = mix(alb, vec3(0.75, 0.10, 0.08), red);
-    float sh = softShadow(pos, sun);
-    float dif = clamp(dot(n, sun), 0.0, 1.0) * sh;
-    float skyA = clamp(0.5 + 0.5 * n.y, 0.0, 1.0);
-    vec3 lin = vec3(1.30, 1.02, 0.78) * 2.2 * dif + vec3(0.42, 0.56, 0.82) * 0.55 * skyA;
-    vec3 hlf = normalize(sun - rd);
-    col = alb * lin + vec3(1.0, 0.9, 0.75) * pow(clamp(dot(n, hlf), 0.0, 1.0), 60.0) * sh * 0.8;
-    col = applyFog(col, ro, rd, t, sun);
+
   } else if (mat == 4) {
+    vec3 pos = ro + rd * t;
+    float dT = pos.y - terrainShape(pos.xz);
+    vec3 pe = plantEval(pos, dT, t);
+    float rnd = pe.y, yn = pe.z;
+    // ALIEN BLUES (v4.4): color keys off the tree's actual size — the same
+    // hash + treeShare curve the SDF uses — so small ferns are deep navy and
+    // the big ones turn light fluo cyan.
+    vec2 cell = floor(pos.xz / FCELL);
+    float sn = pow(hash(cell + 51.0), mix(5.0, 1.2, uTreeShare));   // 0 small → 1 big
+    vec3 alb = mix(vec3(0.020, 0.055, 0.20), vec3(0.24, 0.66, 1.02), sn);
+    alb *= 0.88 + 0.24 * fract(rnd * 7.31);            // slight per-tree variation
+    alb *= 0.72 + 0.55 * yn;                           // brighter toward the tips
+    // cheap cone normal: radial from the plant axis + upward bias
+    vec2 ctr = (cell + 0.5) * FCELL + (vec2(hash(cell + 13.0), hash(cell + 37.0)) - 0.5) * 12.0;
+    vec3 n = normalize(vec3(pos.x - ctr.x, 2.4, pos.z - ctr.y));
+    float ndl = clamp(dot(n, sun), 0.0, 1.0);
+    float sh = (ndl > 0.02) ? softShadow(pos + vec3(0.0, 1.2, 0.0), sun) : 0.0;
+    vec3 lin = sunLightCol(sun) * 2.0 * ndl * sh
+             + skyAmbCol(sun) * 0.55 * clamp(0.5 + 0.5 * n.y, 0.0, 1.0);
+    col = alb * lin;
+    // glow-in-the-dark: an unlit emissive that scales with size (big = more
+    // glow) and height on the plant, and INTENSIFIES at dusk. Part is added
+    // after the fog so distant groves still shine through the haze.
+    float glow = mix(0.05, 0.60, sn) * (0.40 + 0.60 * yn) * (0.7 + 1.2 * duskAmount(sun));
+    vec3 glowC = mix(vec3(0.08, 0.30, 0.85), vec3(0.30, 0.85, 1.15), sn);
+    col += glowC * glow * 0.7;
+    col += glowC * smoothstep(0.82, 1.0, yn) * (0.25 + 0.55 * sn);   // luminous frond tips
+    col = applyFog(col, ro, rd, t, sun);
+    col += glowC * glow * 0.3;                         // post-fog: shines through haze
+
+  } else if (mat == 5) {
     vec3 pos = ro + rd * t;
     vec3 n = ringNormal(pos);
     vec3 lp = vec3(0.0);
@@ -411,7 +772,7 @@ void main() {
     float sh = softShadow(pos + n * 0.5, sun);
     float dif = clamp(dot(n, sun), 0.0, 1.0) * sh;
     float skyA = clamp(0.5 + 0.5 * n.y, 0.0, 1.0);
-    vec3 lin = vec3(1.3, 1.02, 0.78) * 1.5 * dif + vec3(0.42, 0.56, 0.82) * 0.6 * skyA;
+    vec3 lin = sunLightCol(sun) * 1.5 * dif + skyAmbCol(sun) * 0.6 * skyA;
     vec3 hlf = normalize(sun - rd);
     float spec = pow(clamp(dot(n, hlf), 0.0, 1.0), 32.0);
     col = alb * lin + vec3(1.0, 0.9, 0.7) * spec * sh;
@@ -419,11 +780,35 @@ void main() {
     col += vec3(1.0, 0.6, 0.1) * pow(rim, 2.0) * 0.8;
     col += alb * 0.4;
     col = applyFog(col, ro, rd, t, sun);
+
+  } else {
+    vec3 pos = ro + rd * t;
+    vec3 n = craftNormal(pos);
+    vec3 lp = toCraftLocal(pos);
+    // livery: white body, signal-red nose / wingtips / fin
+    vec3 alb = vec3(0.88, 0.89, 0.92);
+    float red = clamp(step(1.65, lp.z) + step(2.55, abs(lp.x)) + ((lp.y > 0.35 && lp.z < -1.6) ? 1.0 : 0.0), 0.0, 1.0);
+    alb = mix(alb, uLivery, red);
+    float sh = softShadow(pos, sun);
+    float dif = clamp(dot(n, sun), 0.0, 1.0) * sh;
+    float skyA = clamp(0.5 + 0.5 * n.y, 0.0, 1.0);
+    vec3 lin = sunLightCol(sun) * 2.2 * dif + skyAmbCol(sun) * 0.55 * skyA;
+    vec3 hlf = normalize(sun - rd);
+    col = alb * lin + vec3(1.0, 0.9, 0.75) * pow(clamp(dot(n, hlf), 0.0, 1.0), 60.0) * sh * 0.8;
+    col = applyFog(col, ro, rd, t, sun);
   }
 
+  // cumulonimbus over everything nearer than the hit (or the whole sky)
+  if (uCloudN > 0.5) {
+    vec4 cld = cloudLayer(ro, rd, (mat == 0) ? T_MAX : t, sun);
+    col = mix(col, cld.rgb, cld.a);
+  }
+
+  // filmic-ish tonemap + gamma + gentle vignette
   col = 1.0 - exp(-col * 1.15);
   col = pow(col, vec3(0.4545));
   vec2 vuv = gl_FragCoord.xy / uResolution;
   col *= 0.35 + 0.65 * pow(16.0 * vuv.x * vuv.y * (1.0 - vuv.x) * (1.0 - vuv.y), 0.20);
+
   fragColor = vec4(col, 1.0);
 }`;

@@ -1,50 +1,89 @@
-// WebGL2 setup and per-frame rendering: shader compilation, uniform upload,
-// canvas sizing and adaptive render-scale quality control.
+// WebGL2 setup: context, shader compilation, uniform locations, resize with
+// adaptive render scale. The per-frame uniform upload + draw + probe readback
+// live in main.js (they touch nearly every subsystem).
 
 import { vsSrc, fsSrc } from './shaders.js';
-import { TAN_HALF_FOV } from './config.js';
 
 export const canvas = document.getElementById('c');
-const gl = canvas.getContext('webgl2', { antialias: false, powerPreference: 'high-performance' });
+export const gl = canvas.getContext('webgl2', { antialias: false, powerPreference: 'high-performance' });
 
-const view = {
-  renderScale: 0.85,
-  DPR: Math.min(window.devicePixelRatio || 1, 1.0),
-};
-
-let U = null;
-
-function fatal(msg) {
+export function fatal(msg) {
   const e = document.getElementById('err');
   e.textContent = 'SHADER / GL ERROR\n\n' + msg;
   e.style.display = 'block';
   console.error(msg);
 }
 
-function compileShader(type, src) {
-  const s = gl.createShader(type);
-  gl.shaderSource(s, src);
-  gl.compileShader(s);
-  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) { fatal(gl.getShaderInfoLog(s)); return null; }
-  return s;
+// Per-pixel raymarching cost scales with pixel COUNT — cap DPR at 1.0.
+let renderScale = 0.85;                    // start a notch below full, adapt up/down
+const DPR = Math.min(window.devicePixelRatio || 1, 1.0);
+export function setRenderScale(s) { renderScale = s; }
+export function adjustQuality(fps) {
+  if (fps < 32 && renderScale > 0.4) renderScale = Math.max(0.4, renderScale - 0.15); // drop harder, floor lower (iGPU)
+  else if (fps > 56 && renderScale < 1.0) renderScale = Math.min(1.0, renderScale + 0.05);
 }
 
-// Returns false (after showing the error overlay) if WebGL2 or the shaders fail.
-export function initRenderer() {
+export function resize() {
+  const w = Math.round(canvas.clientWidth * DPR * renderScale);
+  const h = Math.round(canvas.clientHeight * DPR * renderScale);
+  if (canvas.width !== w || canvas.height !== h) {
+    canvas.width = w; canvas.height = h;
+    gl.viewport(0, 0, w, h);
+  }
+}
+window.addEventListener('resize', resize);
+
+export const nextFrame = () => new Promise(r => requestAnimationFrame(r));
+
+export const U = {};
+
+// Async init (v5.6): what takes 15-20 s at page load is NOT building the
+// world (there is no stored geometry — the GPU recomputes every mountain per
+// pixel per frame). It is the DRIVER translating the ~800-line looping
+// shader into GPU machine code (on Windows: GLSL -> HLSL -> D3D bytecode).
+// With KHR_parallel_shader_compile we poll instead of blocking, so the start
+// screen stays alive and animated during the wait.
+export async function initRenderer(status, lock) {
   if (!gl) {
     document.body.innerHTML = '<p style="color:#fff;font-family:monospace;padding:20px">WebGL2 required.</p>';
     return false;
   }
-  const vs = compileShader(gl.VERTEX_SHADER, vsSrc);
-  const fs = compileShader(gl.FRAGMENT_SHADER, fsSrc);
-  if (!vs || !fs) return false;
+  status('compiling the world shader \u2026');
+  await nextFrame(); await nextFrame();   // let the overlay paint first
+  const vs = gl.createShader(gl.VERTEX_SHADER);
+  gl.shaderSource(vs, vsSrc); gl.compileShader(vs);
+  const fs = gl.createShader(gl.FRAGMENT_SHADER);
+  gl.shaderSource(fs, fsSrc); gl.compileShader(fs);
   const prog = gl.createProgram();
   gl.attachShader(prog, vs);
   gl.attachShader(prog, fs);
   gl.linkProgram(prog);
-  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) { fatal(gl.getProgramInfoLog(prog)); return false; }
+  const ext = gl.getExtension('KHR_parallel_shader_compile');
+  if (ext) {
+    const parts = ['terrain raymarcher', 'alien flora', 'cumulonimbus', 'ring course', 'water & sky', 'collision probe'];
+    let mi = 0, t0 = performance.now();
+    while (!gl.getProgramParameter(prog, ext.COMPLETION_STATUS_KHR)) {
+      await nextFrame();
+      if (performance.now() - t0 > 1300) {
+        t0 = performance.now(); mi++;
+        status('compiling the world shader \u2014 ' + parts[mi % parts.length] + ' \u2026');
+      }
+    }
+  } else {
+    // no async compile: the link check below will freeze the tab. Grey out
+    // the pilot fields so they don't look clickable while dead (Firefox).
+    lock(true);
+    status('compiling the world shader \u2014 the browser may freeze for a moment, hang tight \u2026');
+    await nextFrame(); await nextFrame();
+  }
+  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+    fatal((gl.getShaderInfoLog(vs) || '') + '\n' + (gl.getShaderInfoLog(fs) || '') + '\n' + (gl.getProgramInfoLog(prog) || ''));
+    return false;
+  }
+  lock(false);   // compile done — name & color are live again
   gl.useProgram(prog);
 
+  // fullscreen triangle
   const buf = gl.createBuffer();
   gl.bindBuffer(gl.ARRAY_BUFFER, buf);
   gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
@@ -52,46 +91,8 @@ export function initRenderer() {
   gl.enableVertexAttribArray(locPos);
   gl.vertexAttribPointer(locPos, 2, gl.FLOAT, false, 0, 0);
 
-  U = {};
-  ['uResolution','uTime','uCamPos','uCamMat','uSunDir','uFov','uJitter','uPixScale','uCraftPos','uCraftMat','uRingsPos','uRingMats']
+  ['uResolution','uTime','uCamPos','uCamMat','uSunDir','uFov','uJitter','uPixScale','uCraftPos','uCraftMat','uBulletPos','uBombPos','uBlastCell','uCloudPos','uCloudN',
+   'uRingsPos','uRingMats','uLivery','uOceanSlope','uOceanMax','uMassDecay','uMountAmp','uSnowLine','uFogDens','uJuliaC','uSnowFrac','uFloraDens','uFloraRange','uTreeSize','uTreeShare','uTreeTiers','uTreeFract','uCollected']
     .forEach(n => U[n] = gl.getUniformLocation(prog, n));
-
-  window.addEventListener('resize', resize);
-  resize();
   return true;
-}
-
-export function setRenderScale(s) {
-  view.renderScale = s;
-}
-
-// Called with the measured FPS every ~0.75s; trades resolution for frame rate.
-export function adjustQuality(fps) {
-  if (fps < 32 && view.renderScale > 0.4) view.renderScale = Math.max(0.4, view.renderScale - 0.15);
-  else if (fps > 56 && view.renderScale < 1.0) view.renderScale = Math.min(1.0, view.renderScale + 0.05);
-}
-
-export function resize() {
-  const w = Math.round(canvas.clientWidth * view.DPR * view.renderScale);
-  const h = Math.round(canvas.clientHeight * view.DPR * view.renderScale);
-  if (canvas.width !== w || canvas.height !== h) {
-    canvas.width = w; canvas.height = h;
-    gl.viewport(0, 0, w, h);
-  }
-}
-
-export function render(f) {
-  gl.uniform2f(U.uResolution, canvas.width, canvas.height);
-  gl.uniform1f(U.uTime, f.time);
-  gl.uniform3fv(U.uCamPos, f.camPos);
-  gl.uniformMatrix3fv(U.uCamMat, false, f.camMat);
-  gl.uniform3fv(U.uSunDir, f.sunDir);
-  gl.uniform1f(U.uFov, TAN_HALF_FOV);
-  gl.uniform2f(U.uJitter, 0, 0);
-  gl.uniform1f(U.uPixScale, 2 * TAN_HALF_FOV / canvas.height);
-  gl.uniform3fv(U.uCraftPos, f.craftPos);
-  gl.uniformMatrix3fv(U.uCraftMat, false, f.craftMat);
-  gl.uniform4fv(U.uRingsPos, f.ringsPos);
-  gl.uniformMatrix3fv(U.uRingMats, false, f.ringMats);
-  gl.drawArrays(gl.TRIANGLES, 0, 3);
 }

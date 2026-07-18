@@ -1,73 +1,226 @@
 // Entry point: wires the modules together and runs the main loop.
+// The per-frame uniform upload + draw + probe readback live here because they
+// touch nearly every subsystem (flight, rings, weapons, clouds, tuning).
 
-import { START } from './config.js';
-import { craft, camPos, sun } from './state.js';
-import { canvas, initRenderer, setRenderScale, adjustQuality, resize, render } from './renderer.js';
-import { initRings, updateRings, packRingData, getScore } from './rings.js';
-import { update } from './flight.js';
-import { updateHUD, pulseScore } from './hud.js';
+import { TAN_HALF_FOV, MAXB, MAXBOMB, BLASTC, MAXCLOUD } from './config.js';
+import { craft, camPos, sun, probe } from './state.js';
+import { canvas, gl, U, initRenderer, resize, adjustQuality, setRenderScale, nextFrame } from './renderer.js';
+import { TUNE, buildTunePanel } from './tune.js';
 import { initInput, IS_TOUCH } from './input.js';
+import { update, resetFlight, grindAmt } from './flight.js';
+import { initRings, updateRings, packRingData, ringsPosData, ringsMatsData } from './rings.js';
+import { initCollectedTex } from './spores.js';
+import { bullets, bombs, impacts, bulletUniform, bulletProbePos, gpuBulletGround, gpuBulletPlant,
+         bombUniform, gpuBombGround, activeBlast, blastUniform, gpuBlastPlant } from './weapons.js';
+import { clouds, cloudArr, genClouds } from './clouds.js';
+import { updateHUD } from './hud.js';
+import { ensureAudio } from './audio.js';
+import { drawTrail } from './fx.js';
 
-function resetGame() {
-  craft.pos = [START.x, START.y, START.z];
-  craft.yaw = START.yaw; craft.pitch = START.pitch; craft.roll = 0;
-  initRings();
+// GPU collision probe readback buffer + grind-shake scratch
+const probeBuf = new Uint8Array(85 * 4);   // px 0-1 craft · 2-17 bullets · 18-81 blast cells · 82-84 bombs
+const shakeCam = [0, 0, 0];   // scratch: camPos + grind jitter, uploaded to the GPU
+
+window.__ffBooted = true;   // tells the index.html watchdog the module loaded
+
+// ---- start screen (v5.7) ----
+let running = false;
+const $status = document.getElementById('loadStatus');
+const $startOv = document.getElementById('start');
+const $startBtn = document.getElementById('startBtn');
+const $pilotName = document.getElementById('pilotName');
+const $livery = document.getElementById('liveryColor');
+const $pilotTag = document.getElementById('pilotTag');
+const setStatus = t => { $status.textContent = t; };
+const lockFields = on => {
+  $pilotName.disabled = on; $livery.disabled = on;
+  document.querySelectorAll('#swatches .sw').forEach(b => { b.disabled = on; });
+};
+function hexToLin(hex) {
+  // sRGB picker value -> the shader's linear-ish color space (gamma 2.2)
+  const n = parseInt(hex.slice(1), 16);
+  const f = c => Math.pow(c / 255, 2.2);
+  return [f((n >> 16) & 255), f((n >> 8) & 255), f(n & 255)];
 }
+try {
+  $pilotName.value = localStorage.getItem('ff_name') || '';
+  const c = localStorage.getItem('ff_color');
+  if (c) $livery.value = c;
+} catch (e) { /* storage can be unavailable on file:// — fly anonymous */ }
 
-function main() {
-  if (!initRenderer()) return;
+const $swatches = document.querySelectorAll('#swatches .sw');
+const markSwatch = () => $swatches.forEach(x => x.classList.toggle('sel', x.dataset.c.toLowerCase() === $livery.value.toLowerCase()));
+$swatches.forEach(b => b.addEventListener('click', () => {
+  if (b.disabled) return;
+  $livery.value = b.dataset.c;
+  markSwatch();
+}));
+$livery.addEventListener('input', markSwatch);
+markSwatch();
 
-  if (IS_TOUCH) {
-    document.body.classList.add('touch');
-    setRenderScale(0.6); // heavy shader: start lower on mobile GPUs, auto-scaler adjusts from there
-  }
+async function main() {
+  setStatus('waking up WebGL2 \u2026');
+  await nextFrame();
+  if (!(await initRenderer(setStatus, lockFields))) return;
+  setStatus('linking flight systems \u2026');
+  await nextFrame();
 
-  initInput(canvas, resetGame);
+  buildTunePanel();
+  if (IS_TOUCH) setRenderScale(0.6); // heavy shader: start lower on mobile GPUs, auto-scaler adjusts
+
+  genClouds();
   initRings();
+
+  // collected-cells texture lives on unit 1 for the whole session
+  initCollectedTex();
+  gl.uniform1i(U.uCollected, 1);
+  gl.uniform3f(U.uLivery, ...hexToLin($livery.value));
 
   // Debug handle for the browser console (read-only inspection)
-  window.__fractalFlight = { craft, camPos, sun };
+  window.__fractalFlight = { craft, camPos, sun, probe };
 
   let lastT = performance.now();
   let fpsAcc = 0, fpsN = 0, fpsShown = 0, fpsTimer = 0;
 
   function frame(now) {
-    const dt = Math.min((now - lastT) / 1000, 0.05);
-    lastT = now;
+  const dt = Math.min((now - lastT) / 1000, 0.05);
+  lastT = now;
 
-    const { craftBasis, camBasis } = update(dt);
-    updateRings(craft.pos, craftBasis.fwd, pulseScore);
-    resize();
+  const { craftBasis, camBasis } = update(dt, now);
+  resize();
 
-    fpsAcc += dt; fpsN++; fpsTimer += dt;
-    if (fpsTimer > 0.75) {
-      const fps = fpsN / fpsAcc;
-      fpsShown = Math.round(fps);
-      adjustQuality(fps);
-      fpsAcc = 0; fpsN = 0; fpsTimer = 0;
-    }
-    updateHUD(getScore(), fpsShown);
-
-    const sunDir = [
-      Math.cos(sun.el) * Math.sin(sun.az),
-      Math.sin(sun.el),
-      Math.cos(sun.el) * Math.cos(sun.az)
-    ];
-
-    const ringData = packRingData();
-    render({
-      time: now / 1000,
-      camPos,
-      camMat: camBasis.mat,
-      sunDir,
-      craftPos: craft.pos,
-      craftMat: craftBasis.mat,
-      ringsPos: ringData.pos,
-      ringMats: ringData.mats,
-    });
-    requestAnimationFrame(frame);
+  // dynamic resolution: keep it fluid on weak GPUs, crisp on strong ones
+  fpsAcc += dt; fpsN++; fpsTimer += dt;
+  if (fpsTimer > 0.75) {
+    const fps = fpsN / fpsAcc;
+    fpsShown = Math.round(fps);
+    adjustQuality(fps);
+    fpsAcc = 0; fpsN = 0; fpsTimer = 0;
   }
-  requestAnimationFrame(frame);
+  updateHUD(fpsShown);
+
+  const sunDir = [
+    Math.cos(sun.el) * Math.sin(sun.az),
+    Math.sin(sun.el),
+    Math.cos(sun.el) * Math.cos(sun.az)
+  ];
+
+  gl.uniform2f(U.uResolution, canvas.width, canvas.height);
+  gl.uniform1f(U.uTime, now / 1000);
+  // grind shake: jitter only the rendered camera — camPos itself stays smooth
+  if (grindAmt > 0.001) {
+    const s = grindAmt * (0.45 + craft.speed * 0.0035);
+    shakeCam[0] = camPos[0] + (Math.random() - 0.5) * 2 * s;
+    shakeCam[1] = camPos[1] + (Math.random() - 0.5) * 2 * s;
+    shakeCam[2] = camPos[2] + (Math.random() - 0.5) * 2 * s;
+    gl.uniform3fv(U.uCamPos, shakeCam);
+  } else {
+    gl.uniform3fv(U.uCamPos, camPos);
+  }
+  gl.uniformMatrix3fv(U.uCamMat, false, camBasis.mat);
+  gl.uniform3fv(U.uSunDir, sunDir);
+  gl.uniform1f(U.uFov, TAN_HALF_FOV);
+  gl.uniform2f(U.uJitter, 0, 0); // no temporal accumulation → keep rays fixed = no shimmer
+  gl.uniform1f(U.uPixScale, 2 * TAN_HALF_FOV / canvas.height);
+  gl.uniform3fv(U.uCraftPos, craft.pos);
+  gl.uniformMatrix3fv(U.uCraftMat, false, craftBasis.mat);
+  packRingData();
+  gl.uniform4fv(U.uRingsPos, ringsPosData);
+  gl.uniformMatrix3fv(U.uRingMats, false, ringsMatsData);
+  gl.uniform1f(U.uOceanSlope, TUNE.oceanSlope.v);
+  gl.uniform1f(U.uOceanMax,   TUNE.oceanMax.v);
+  gl.uniform1f(U.uMassDecay,  TUNE.massDecay.v);
+  gl.uniform1f(U.uMountAmp,   TUNE.mountAmp.v);
+  gl.uniform1f(U.uSnowLine,   TUNE.snowLine.v);
+  gl.uniform1f(U.uFogDens,    TUNE.fogDens.v);
+  gl.uniform2f(U.uJuliaC,     TUNE.juliaRe.v, TUNE.juliaIm.v);
+  gl.uniform1f(U.uSnowFrac,   TUNE.snowyPct.v / 100);
+  gl.uniform1f(U.uFloraDens,  TUNE.floraDens.v);
+  gl.uniform1f(U.uFloraRange, TUNE.floraRange.v);
+  gl.uniform1f(U.uTreeSize,   TUNE.treeSize.v);
+  gl.uniform1f(U.uTreeShare,  TUNE.treeShare.v);
+  gl.uniform1f(U.uTreeTiers,  TUNE.treeTiers.v);
+  gl.uniform1f(U.uTreeFract,  TUNE.treeFract.v);
+  probe.pos[0] = craft.pos[0]; probe.pos[1] = craft.pos[1]; probe.pos[2] = craft.pos[2];
+  for (let i = 0; i < MAXB; i++) {
+    const B = bullets[i];
+    if (B) { bulletUniform[i*3] = B.x; bulletUniform[i*3+1] = B.y; bulletUniform[i*3+2] = B.z; }
+    else   { bulletUniform[i*3] = 0;   bulletUniform[i*3+1] = -9999; bulletUniform[i*3+2] = 0; }
+  }
+  gl.uniform3fv(U.uBulletPos, bulletUniform);
+  bulletProbePos.set(bulletUniform);   // next frame's readback answers for these
+  for (let i = 0; i < MAXBOMB; i++) {
+    const B = bombs[i];
+    if (B) { bombUniform[i*3] = B.x; bombUniform[i*3+1] = B.y; bombUniform[i*3+2] = B.z; }
+    else   { bombUniform[i*3] = 0;   bombUniform[i*3+1] = -9999; bombUniform[i*3+2] = 0; }
+  }
+  gl.uniform3fv(U.uBombPos, bombUniform);
+  if (activeBlast && !activeBlast.uploaded) {
+    blastUniform.fill(1e7);
+    for (let j = 0; j < activeBlast.cells.length; j++) {
+      blastUniform[j*2] = activeBlast.cells[j].x;
+      blastUniform[j*2+1] = activeBlast.cells[j].z;
+    }
+    activeBlast.uploaded = true;   // next readback answers these cells
+  } else if (!activeBlast) {
+    blastUniform.fill(1e7);
+  }
+  gl.uniform2fv(U.uBlastCell, blastUniform);
+  const cloudN = Math.min(MAXCLOUD, Math.round(TUNE.cloudCount.v));
+  for (let ci = 0; ci < MAXCLOUD; ci++) {
+    const c = clouds[ci];
+    cloudArr[ci * 4]     = c.x;
+    cloudArr[ci * 4 + 1] = c.y;
+    cloudArr[ci * 4 + 2] = c.z;
+    cloudArr[ci * 4 + 3] = c.f * TUNE.cloudSize.v;
+  }
+  gl.uniform4fv(U.uCloudPos, cloudArr);
+  gl.uniform1f(U.uCloudN, cloudN);
+
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+  // read the collision-probe row (GPU-authoritative ground & tree distance,
+  // for the craft AND every airborne tracer — still one readback call)
+  gl.readPixels(0, 0, 85, 1, gl.RGBA, gl.UNSIGNED_BYTE, probeBuf);
+  probe.ground = ((probeBuf[0] * 65536 + probeBuf[1] * 256 + probeBuf[2]) / 16777215) * 640 - 80;
+  probe.plantD = (probeBuf[4] / 255) * 40;
+  for (let i = 0; i < MAXB; i++) {
+    const o = (2 + i * 2) * 4;
+    gpuBulletGround[i] = ((probeBuf[o] * 65536 + probeBuf[o + 1] * 256 + probeBuf[o + 2]) / 16777215) * 640 - 80;
+    gpuBulletPlant[i]  = (probeBuf[o + 4] / 255) * 40;
+  }
+  for (let j = 0; j < BLASTC; j++) gpuBlastPlant[j] = (probeBuf[(18 + j) * 4] / 255) * 40;
+  for (let i = 0; i < MAXBOMB; i++) {
+    const o = (82 + i) * 4;
+    gpuBombGround[i] = ((probeBuf[o] * 65536 + probeBuf[o + 1] * 256 + probeBuf[o + 2]) / 16777215) * 640 - 80;
+  }
+
+  drawTrail(camBasis, now, bullets, bombs, impacts);
+  if (running) requestAnimationFrame(frame);
+}
+  setStatus('spinning up the GPU \u2014 first frame \u2026');
+  await nextFrame();
+  resize();
+  frame(performance.now());   // warm-up: run the full pipeline once (loop not running yet)
+  setStatus('Ready for flight');
+  $startOv.classList.add('ready');   // spinner disappears, status grows
+  $startBtn.style.display = 'inline-block';
+
+  $startBtn.addEventListener('click', () => {
+    try {
+      localStorage.setItem('ff_name', $pilotName.value);
+      localStorage.setItem('ff_color', $livery.value);
+    } catch (e) {}
+    gl.uniform3f(U.uLivery, ...hexToLin($livery.value));
+    const nm = $pilotName.value.trim();
+    if (nm) { $pilotTag.textContent = 'PILOT \u00b7 ' + nm.toUpperCase(); $pilotTag.style.display = 'block'; }
+    $startOv.style.display = 'none';
+    initInput(resetFlight);   // inputs bind only now — typing a pilot name can't steer
+    ensureAudio();            // user gesture: engine sound can start right away
+    running = true;
+    lastT = performance.now();
+    requestAnimationFrame(frame);
+  });
 }
 
 main();
