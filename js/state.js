@@ -18,6 +18,13 @@ export function craftB() {
 }
 
 export const camPos = [craft.pos[0], craft.pos[1] + 6, craft.pos[2] - 18];
+// the RENDERED camera position: chase camera + mouse orbit (flight.js fills
+// it every frame; renderer upload AND 2D overlay projection both read it)
+export const viewPos = [camPos[0], camPos[1], camPos[2]];
+// wheel-zoom target (input.js writes, flight.js eases) + pilot-view flag
+export const viewZoom = { t: 1, cockpit: 0 };
+// cockpit gaze basis: when on, guns/bombs fire along the pilot's view
+export const pilotAim = { on: 0, fwd: [0, 0, 1], right: [-1, 0, 0], up: [0, 1, 0] };
 export const sun = { az: 2.55, el: 0.20 };   // low sun -> long shadows
 
 export const flags = { crashed: false };

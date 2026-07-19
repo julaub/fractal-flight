@@ -1,5 +1,5 @@
 import { WATER_LEVEL, MAXB, BULLET_SPEED, BULLET_RANGE, MAXBOMB, BLAST_R, BLASTC, RING_N, BOMB_BOOST } from './config.js';
-import { craft, craftB, flags } from './state.js';
+import { craft, craftB, flags, pilotAim } from './state.js';
 import { TUNE } from './tune.js';
 import { terrainShapeJ } from './terrain.js';
 import { fireSound, bombDropSound, explosionSound } from './audio.js';
@@ -22,7 +22,7 @@ export function fireGun() {
   let slot = -1;
   for (let i = 0; i < MAXB; i++) if (!bullets[i]) { slot = i; break; }
   if (slot < 0) return;      // all 8 tracers airborne — wait for one to land
-  const b = craftB();
+  const b = pilotAim.on ? pilotAim : craftB();   // cockpit view: shoot where you look
   const sp = craft.speed + BULLET_SPEED;
   const B = {
     x: craft.pos[0] + b.fwd[0] * 4.0,   // nose tip
@@ -89,7 +89,7 @@ export function dropBomb() {
   let slot = -1;
   for (let i = 0; i < MAXBOMB; i++) if (!bombs[i]) { slot = i; break; }
   if (slot < 0) return;      // 3 already falling — wait for a hit
-  const b = craftB();
+  const b = pilotAim.on ? pilotAim : craftB();   // cockpit view: bomb where you look
   // boost direction: horizontal heading (nose direction, dive angle removed)
   let hx = b.fwd[0], hz = b.fwd[2];
   const hl = Math.hypot(hx, hz) || 1; hx /= hl; hz /= hl;

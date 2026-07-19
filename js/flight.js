@@ -3,9 +3,9 @@
 // Also owns the chase camera and the grind-then-crash ground contact.
 
 import { WATER_LEVEL, GRIND_DEPTH, START } from './config.js';
-import { craft, craftB, camPos, flags, probe } from './state.js';
+import { craft, craftB, camPos, viewPos, viewZoom, pilotAim, flags, probe } from './state.js';
 import { normalize3, cross3, rotV, clamp1 } from './math.js';
-import { keys, touchInput, gyroInput, mouse } from './input.js';
+import { keys, touchInput, gyroInput, mouse, mouseView, viewOrigin, IS_TOUCH } from './input.js';
 import { terrainShapeJ } from './terrain.js';
 import { doCrash, unCrash } from './hud.js';
 import { collectTree } from './spores.js';
@@ -18,6 +18,11 @@ import { emitTrail } from './fx.js';
 // v4.0 chase camera: its own persistent triad, eased toward the craft's each
 // frame — through a loop the camera's horizon rolls over with the plane.
 let camR = [-1, 0, 0], camU = [0, 1, 0], camF = [0, 0, 1];
+// mouse-orbit state (v7.4): eased angles + their targets
+let orbitYaw = 0, orbitPitch = 0, orbitYawT = 0, orbitPitchT = 0;
+let followHdg = [0, 0, 1];   // level-flight heading memory (far-zoom loop exception)
+let followWCur = 1;          // latched follow weight (1 = chase the nose, 0 = stand off level)
+let zoomCur = 1;   // eased wheel zoom (viewZoom.t is the target)
 
 export function resetFlight() {
   craft.pos = [START.x, START.y, START.z];
@@ -25,6 +30,10 @@ export function resetFlight() {
   craft.rollVel = 0; craft.pitchVel = 0;
   craft.speed = 95;
   camR = [-1, 0, 0]; camU = [0, 1, 0]; camF = [0, 0, 1];
+  // R also resets the view (v7.7): default zoom, orbit recentered on the cursor
+  viewZoom.t = 1; zoomCur = 1;
+  viewOrigin.x = mouseView.x; viewOrigin.y = mouseView.y;
+  orbitYaw = 0; orbitPitch = 0; orbitYawT = 0; orbitPitchT = 0;
   unCrash();
   initRings();
 }
@@ -44,6 +53,9 @@ export function update(dt, now) {
     engineUpdate(0, false, 0, 0);
     grindUpdate(0);
     cloudWindUpdate(0);
+    viewZoom.cockpit = 0;   // the wreck should be visible
+    pilotAim.on = 0;
+    viewPos[0] = camPos[0]; viewPos[1] = camPos[1]; viewPos[2] = camPos[2];
     return { craftBasis: b,
              camBasis: { right: cr, up: cu, fwd: cf, mat: new Float32Array([...cr, ...cu, ...cf]) } };
   }
@@ -210,12 +222,53 @@ export function update(dt, now) {
   // craft's — through a loop the horizon rolls over with you; inverted
   // flight looks inverted. Position hangs behind/above along the CAMERA's
   // axes so it swings smoothly instead of snapping with the plane.
+  // wheel zoom (v7.4): eased here because the whole chase geometry scales
+  // with it. The look-ahead anchor MUST scale too: with a fixed 30 m anchor
+  // the camera-pitch equilibrium (30·(f·camU) ≈ 5.5·zoom) stops existing
+  // beyond zoom ≈ 5.5, and with no fixed point the pitch integrates forever —
+  // the far-zoom "whole world starts orbiting the plane" bug. Scaling the
+  // anchor keeps the zoom-1 geometry, and its equilibrium, at any distance.
+  zoomCur += (viewZoom.t - zoomCur) * Math.min(1, dt * 5);
+  const zA = 30 * Math.max(1, zoomCur);
+  // far-zoom loop exception (v7.8): when the camera arm is longer than the
+  // plane's height above the terrain, following the nose through a loop
+  // would drag the camera into the ground. The camera keeps a MEMORY of the
+  // level-flight heading — refreshed only while flying roughly level and
+  // upright, so aerobatics can't corrupt it — and past that arm/altitude
+  // ratio it follows the memory instead: it stands off, stays level, and
+  // watches the loop from outside. Smoothly blended; no effect at close
+  // zoom or high altitude.
+  if (Math.abs(craft.f[1]) < 0.7 && craft.u[1] > 0.2) {
+    const hm = Math.hypot(craft.f[0], craft.f[2]) || 1;
+    const kh = Math.min(1, dt * 4);
+    followHdg[0] += (craft.f[0] / hm - followHdg[0]) * kh;
+    followHdg[2] += (craft.f[2] / hm - followHdg[2]) * kh;
+    const hl = Math.hypot(followHdg[0], followHdg[2]) || 1;
+    followHdg[0] /= hl; followHdg[2] /= hl;
+  }
+  const camAlt = craft.pos[1] - Math.max(groundH, WATER_LEVEL);
+  const targetW = 1 - Math.min(1, Math.max(0, (17.8 * zoomCur / Math.max(camAlt, 1) - 0.9) / 0.4));
+  // LATCHED: standing off engages at any moment, but the follow only
+  // RE-engages during level upright flight — otherwise the altitude gained
+  // mid-loop would flip the camera back into chasing the maneuver halfway
+  if (targetW < followWCur) followWCur += (targetW - followWCur) * Math.min(1, dt * 3);
+  else if (Math.abs(craft.f[1]) < 0.35 && craft.u[1] > 0.5) followWCur += (targetW - followWCur) * Math.min(1, dt * 1.5);
+  const followW = followWCur;
+  let eF = [b.fwd[0] * followW + followHdg[0] * (1 - followW),
+            b.fwd[1] * followW,
+            b.fwd[2] * followW + followHdg[2] * (1 - followW)];
+  const eFl = Math.hypot(eF[0], eF[1], eF[2]);
+  eF = eFl > 1e-3 ? [eF[0] / eFl, eF[1] / eFl, eF[2] / eFl] : [followHdg[0], 0, followHdg[2]];
   const lookAt = [
-    craft.pos[0] + b.fwd[0] * 30,
-    craft.pos[1] + b.fwd[1] * 30,
-    craft.pos[2] + b.fwd[2] * 30
+    craft.pos[0] + eF[0] * zA,
+    craft.pos[1] + eF[1] * zA,
+    craft.pos[2] + eF[2] * zA
   ];
-  const kv = Math.min(1, dt * 4.2);
+  // close zooms stiffen the springs: the chase lag (~27 m at cruise) would
+  // otherwise keep the camera away no matter how far you scroll in — the
+  // plane now fills the screen before the view drops into the cockpit
+  const zStiff = Math.min(1, zoomCur);
+  const kv = Math.min(1, dt * 4.2 / zStiff);
   const tF = normalize3([lookAt[0] - camPos[0], lookAt[1] - camPos[1], lookAt[2] - camPos[2]]);
   camF = normalize3([camF[0] + (tF[0] - camF[0]) * kv,
                      camF[1] + (tF[1] - camF[1]) * kv,
@@ -235,6 +288,8 @@ export function update(dt, now) {
   const cuT = [clu[0] * (1 - wF) + craft.u[0] * wF,
                clu[1] * (1 - wF) + craft.u[1] * wF,
                clu[2] * (1 - wF) + craft.u[2] * wF];
+  // loop exception: a stood-off camera keeps a level horizon
+  cuT[0] *= followW; cuT[1] = cuT[1] * followW + (1 - followW); cuT[2] *= followW;
   const uT = [camU[0] + (cuT[0] - camU[0]) * kv,
               camU[1] + (cuT[1] - camU[1]) * kv,
               camU[2] + (cuT[2] - camU[2]) * kv];
@@ -244,16 +299,97 @@ export function update(dt, now) {
     camR = [nR[0]/nRl, nR[1]/nRl, nR[2]/nRl];
     camU = cross3(camR, camF);
   }
+  const zd = 17 * zoomCur;
+  // far-zoom framing (v7.7): the craft's screen height is set purely by the
+  // camera arm's height/distance ratio — the rig rotates rigidly about its
+  // equilibrium, so aiming tricks don't move it. Blending the ratio from the
+  // classic 5.5/17 down to 4.0/17 as you zoom out parks the plane at ~1/3
+  // from the bottom instead of 1/4. The default view is untouched.
+  const zh = (5.5 - 1.5 * Math.min(1, Math.max(0, (zoomCur - 1) / 9))) * zoomCur;
   const desired = [
-    craft.pos[0] - camF[0] * 17 + camU[0] * 5.5,
-    craft.pos[1] - camF[1] * 17 + camU[1] * 5.5,
-    craft.pos[2] - camF[2] * 17 + camU[2] * 5.5
+    craft.pos[0] - camF[0] * zd + camU[0] * zh,
+    craft.pos[1] - camF[1] * zd + camU[1] * zh,
+    craft.pos[2] - camF[2] * zd + camU[2] * zh
   ];
-  const k = Math.min(1, dt * 3.5);
+  const k = Math.min(1, dt * 3.5 / zStiff);
   camPos[0] += (desired[0] - camPos[0]) * k;
   camPos[1] += (desired[1] - camPos[1]) * k;
   camPos[2] += (desired[2] - camPos[2]) * k;
 
+  // ---- mouse-orbit view (v7.4) ----
+  // The mouse position orbits the RENDER camera around the plane: full screen
+  // width = 360° of yaw (mouse right = see the plane's LEFT side), vertical =
+  // ±90° (top edge = top-down). A dead circle around the plane (its screen
+  // footprint + 20 px) keeps the classic chase view; angles ease so the view
+  // swings instead of snapping. The chase camera itself is untouched — the
+  // orbit only rotates what is rendered, and BOTH pipelines (GPU + 2D
+  // overlay) consume the same rotated view, so nothing can misalign.
+  if (!IS_TOUCH) {
+    const vw = window.innerWidth, vh = window.innerHeight;
+    const mdx = mouseView.x - viewOrigin.x, mdy = mouseView.y - viewOrigin.y;   // v7.4: middle-click rebases the center
+    const mr = Math.hypot(mdx, mdy);
+    const dead = vh * 0.13 + 20;              // ~the plane's screen size + 20 px
+    let mm = (mr - dead) / 60;                // smooth onset past the circle
+    mm = Math.max(0, Math.min(1, mm));
+    mm = mm * mm * (3 - 2 * mm);
+    orbitYawT   = -(mdx / (vw / 2)) * Math.PI * mm;         // edge = 180°
+    orbitPitchT =  (mdy / (vh / 2)) * (Math.PI / 2) * mm;   // edge = 90°
+  }
+  orbitYaw   += (orbitYawT   - orbitYaw)   * Math.min(1, dt * 6);
+  orbitPitch += (orbitPitchT - orbitPitch) * Math.min(1, dt * 6);
+
+  // ---- cockpit / pilot view (v7.4) ----
+  // Zoomed all the way in: the camera sits at the canopy, the plane is not
+  // rendered (uCockpit hides it in the shader), and the mouse angles become
+  // the pilot's HEAD: mouse right = look right, top edge = look straight up.
+  // The craft's own basis carries the view, so banking rolls the horizon.
+  pilotAim.on = 0;
+  viewZoom.cockpit = zoomCur < 0.13 ? 1 : 0;
+  if (viewZoom.cockpit) {
+    const lyaw = orbitYaw, lpit = -orbitPitch;
+    let pF = craft.f, pR = craft.r, pU = craft.u;
+    if (Math.abs(lyaw) > 1e-3) { pF = rotV(pF, craft.u, lyaw); pR = rotV(pR, craft.u, lyaw); }
+    if (Math.abs(lpit) > 1e-3) { pU = rotV(craft.u, pR, lpit); pF = rotV(pF, pR, lpit); }
+    // guns & bombs follow the pilot's gaze (v7.4): weapons read pilotAim
+    pilotAim.on = 1;
+    pilotAim.fwd[0] = pF[0]; pilotAim.fwd[1] = pF[1]; pilotAim.fwd[2] = pF[2];
+    pilotAim.right[0] = pR[0]; pilotAim.right[1] = pR[1]; pilotAim.right[2] = pR[2];
+    pilotAim.up[0] = pU[0]; pilotAim.up[1] = pU[1]; pilotAim.up[2] = pU[2];
+    viewPos[0] = craft.pos[0] + craft.f[0] * 0.8 + craft.u[0] * 0.35;
+    viewPos[1] = craft.pos[1] + craft.f[1] * 0.8 + craft.u[1] * 0.35;
+    viewPos[2] = craft.pos[2] + craft.f[2] * 0.8 + craft.u[2] * 0.35;
+    return { craftBasis: b,
+             camBasis: { right: pR, up: pU, fwd: pF, mat: new Float32Array([...pR, ...pU, ...pF]) } };
+  }
+
+  let vR = camR, vU = camU, vF = camF;
+  viewPos[0] = camPos[0]; viewPos[1] = camPos[1]; viewPos[2] = camPos[2];
+  if (Math.abs(orbitYaw) > 1e-3 || Math.abs(orbitPitch) > 1e-3) {
+    const c = craft.pos;
+    let off = [camPos[0] - c[0], camPos[1] - c[1], camPos[2] - c[2]];
+    off = rotV(off, camU, orbitYaw);          // yaw about the camera's up
+    vF = rotV(camF, camU, orbitYaw);
+    vR = rotV(camR, camU, orbitYaw);
+    off = rotV(off, vR, orbitPitch);          // then pitch about the yawed right
+    vF = rotV(vF, vR, orbitPitch);
+    vU = rotV(camU, vR, orbitPitch);
+    viewPos[0] = c[0] + off[0]; viewPos[1] = c[1] + off[1]; viewPos[2] = c[2] + off[2];
+  }
+
+  // camera-terrain collision (v7.7): the view camera never sinks into the
+  // ground or the sea — clamped to terrain/water + 3 m, and while clamped it
+  // re-aims at the plane so you skim the ridge instead of staring into rock.
+  const camGround = Math.max(terrainShapeJ(viewPos[0], viewPos[2]), WATER_LEVEL) + 3.0;
+  if (viewPos[1] < camGround) {
+    viewPos[1] = camGround;
+    const cf = normalize3([craft.pos[0] - viewPos[0], craft.pos[1] - viewPos[1], craft.pos[2] - viewPos[2]]);
+    let cr = cross3(cf, [0, 1, 0]);
+    const crl = Math.hypot(cr[0], cr[1], cr[2]);
+    if (crl > 1e-4) {
+      cr = [cr[0] / crl, cr[1] / crl, cr[2] / crl];
+      vR = cr; vU = cross3(cr, cf); vF = cf;
+    }
+  }
   return { craftBasis: b,
-           camBasis: { right: camR, up: camU, fwd: camF, mat: new Float32Array([...camR, ...camU, ...camF]) } };
+           camBasis: { right: vR, up: vU, fwd: vF, mat: new Float32Array([...vR, ...vU, ...vF]) } };
 }

@@ -3,7 +3,7 @@
 // touch nearly every subsystem (flight, rings, weapons, clouds, tuning).
 
 import { TAN_HALF_FOV, MAXB, MAXBOMB, BLASTC, MAXCLOUD } from './config.js';
-import { craft, camPos, sun, probe } from './state.js';
+import { craft, camPos, viewPos, viewZoom, sun, probe } from './state.js';
 import { canvas, gl, U, initRenderer, resize, adjustQuality, setRenderScale, nextFrame } from './renderer.js';
 import { TUNE, buildTunePanel } from './tune.js';
 import { initInput, IS_TOUCH } from './input.js';
@@ -15,10 +15,29 @@ import { bullets, bombs, impacts, bulletUniform, bulletProbePos, gpuBulletGround
 import { clouds, cloudArr, genClouds } from './clouds.js';
 import { updateHUD } from './hud.js';
 import { ensureAudio } from './audio.js';
-import { drawTrail } from './fx.js';
+import { drawTrail, buildFxQueries, fxOcc } from './fx.js';
 
 // GPU collision probe readback buffer + grind-shake scratch
-const probeBuf = new Uint8Array(85 * 4);   // px 0-1 craft · 2-17 bullets · 18-81 blast cells · 82-84 bombs
+const probeBuf = new Uint8Array(133 * 4);  // px 0-1 craft · 2-17 bullets · 18-81 blast cells · 82-84 bombs · 85-132 fx occlusion
+const fxPosArr = new Float32Array(48 * 3); // overlay occlusion query positions
+
+// cursor visibility (v8.0): 100 = native crosshair, 0 = hidden; in between a
+// custom crosshair drawn at that alpha (a native cursor cannot be translucent)
+function applyCursor(v) {
+  if (v <= 0) { canvas.style.cursor = 'none'; return; }
+  if (v >= 100) { canvas.style.cursor = 'crosshair'; return; }
+  const cc = document.createElement('canvas');
+  cc.width = 25; cc.height = 25;
+  const g = cc.getContext('2d');
+  g.globalAlpha = v / 100;
+  g.strokeStyle = '#000'; g.lineWidth = 3;
+  g.beginPath(); g.moveTo(12.5, 1); g.lineTo(12.5, 24); g.moveTo(1, 12.5); g.lineTo(24, 12.5); g.stroke();
+  g.strokeStyle = '#fff'; g.lineWidth = 1;
+  g.beginPath(); g.moveTo(12.5, 2); g.lineTo(12.5, 23); g.moveTo(2, 12.5); g.lineTo(23, 12.5); g.stroke();
+  canvas.style.cursor = 'url(' + cc.toDataURL() + ') 12 12, crosshair';
+}
+let lastCursorA = -1;
+
 const shakeCam = [0, 0, 0];   // scratch: camPos + grind jitter, uploaded to the GPU
 
 window.__ffBooted = true;   // tells the index.html watchdog the module loaded
@@ -98,6 +117,7 @@ async function main() {
     fpsAcc = 0; fpsN = 0; fpsTimer = 0;
   }
   updateHUD(fpsShown);
+  if (TUNE.cursorA.v !== lastCursorA) { lastCursorA = TUNE.cursorA.v; applyCursor(lastCursorA); }
 
   const sunDir = [
     Math.cos(sun.el) * Math.sin(sun.az),
@@ -110,12 +130,12 @@ async function main() {
   // grind shake: jitter only the rendered camera — camPos itself stays smooth
   if (grindAmt > 0.001) {
     const s = grindAmt * (0.45 + craft.speed * 0.0035);
-    shakeCam[0] = camPos[0] + (Math.random() - 0.5) * 2 * s;
-    shakeCam[1] = camPos[1] + (Math.random() - 0.5) * 2 * s;
-    shakeCam[2] = camPos[2] + (Math.random() - 0.5) * 2 * s;
+    shakeCam[0] = viewPos[0] + (Math.random() - 0.5) * 2 * s;
+    shakeCam[1] = viewPos[1] + (Math.random() - 0.5) * 2 * s;
+    shakeCam[2] = viewPos[2] + (Math.random() - 0.5) * 2 * s;
     gl.uniform3fv(U.uCamPos, shakeCam);
   } else {
-    gl.uniform3fv(U.uCamPos, camPos);
+    gl.uniform3fv(U.uCamPos, viewPos);
   }
   gl.uniformMatrix3fv(U.uCamMat, false, camBasis.mat);
   gl.uniform3fv(U.uSunDir, sunDir);
@@ -127,6 +147,10 @@ async function main() {
   packRingData();
   gl.uniform4fv(U.uRingsPos, ringsPosData);
   gl.uniformMatrix3fv(U.uRingMats, false, ringsMatsData);
+  gl.uniform1f(U.uCockpit, viewZoom.cockpit);
+  gl.uniform1f(U.uShadows, TUNE.shadows.v);
+  buildFxQueries(fxPosArr, bullets, bombs, impacts);
+  gl.uniform3fv(U.uFxPos, fxPosArr);
   gl.uniform1f(U.uOceanSlope, TUNE.oceanSlope.v);
   gl.uniform1f(U.uOceanMax,   TUNE.oceanMax.v);
   gl.uniform1f(U.uMassDecay,  TUNE.massDecay.v);
@@ -181,7 +205,7 @@ async function main() {
 
   // read the collision-probe row (GPU-authoritative ground & tree distance,
   // for the craft AND every airborne tracer — still one readback call)
-  gl.readPixels(0, 0, 85, 1, gl.RGBA, gl.UNSIGNED_BYTE, probeBuf);
+  gl.readPixels(0, 0, 133, 1, gl.RGBA, gl.UNSIGNED_BYTE, probeBuf);
   probe.ground = ((probeBuf[0] * 65536 + probeBuf[1] * 256 + probeBuf[2]) / 16777215) * 640 - 80;
   probe.plantD = (probeBuf[4] / 255) * 40;
   for (let i = 0; i < MAXB; i++) {
@@ -194,6 +218,7 @@ async function main() {
     const o = (82 + i) * 4;
     gpuBombGround[i] = ((probeBuf[o] * 65536 + probeBuf[o + 1] * 256 + probeBuf[o + 2]) / 16777215) * 640 - 80;
   }
+  for (let i = 0; i < 48; i++) fxOcc.vis[i] = probeBuf[(85 + i) * 4];
 
   drawTrail(camBasis, now, bullets, bombs, impacts);
   if (running) requestAnimationFrame(frame);

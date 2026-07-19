@@ -1,6 +1,8 @@
 // ============ TUNING PANEL ============
 // Each knob: v = live value, d = default, min/max/step, fmt = display formatting.
 export const TUNE = {
+  shadows:    { label: 'shadows',     v: 1,       d: 1,       min: 0,      max: 1,      step: 1,       fmt: x => x > 0.5 ? 'on' : 'off' },
+  cursorA:    { label: 'cursor',      v: 0,       d: 0,       min: 0,      max: 100,    step: 5,       fmt: x => x.toFixed(0) + '%' },
   oceanSlope: { label: 'ocean slope', v: 0.026,   d: 0.026,    min: 0.004,  max: 0.06,   step: 0.001,   fmt: x => x.toFixed(3) },
   oceanMax:   { label: 'ocean depth', v: 116,     d: 116,      min: 20,     max: 140,    step: 1,       fmt: x => x.toFixed(0) },
   massDecay:  { label: 'coast width', v: 0.001,  d: 0.001,  min: 0.001,  max: 0.01,   step: 0.0001,  fmt: x => x.toFixed(4) },

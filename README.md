@@ -1,4 +1,4 @@
-# Fractal Alps — Mandelbrot Flight v7.0
+# Fractal Alps — Mandelbrot Flight v8.0
 
 A WebGL2 raymarched flight game over Mandelbrot-shaped mountains — the merge
 of both branches of the ping-pong: jul's ring course on top of the v4.6
