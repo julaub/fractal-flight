@@ -2,7 +2,7 @@
 // joystick, touch buttons, and gyroscope tilt. Each source writes into its
 // own state object; the flight model sums and clamps them.
 
-import { sun } from './state.js';
+import { sun, viewZoom } from './state.js';
 import { canvas } from './renderer.js';
 import { ensureAudio, toggleMute } from './audio.js';
 import { fireGun, dropBomb } from './weapons.js';
@@ -12,6 +12,8 @@ export const keys = Object.create(null);
 export const touchInput = { steer: 0, pitch: 0, lift: 0, boost: false };
 export const gyroInput = { steer: 0, pitch: 0 };
 export const mouse = { lmbDown: false, lastAuto: 0 };   // hold-to-burst state, read by flight.js
+export const mouseView = { x: window.innerWidth / 2, y: window.innerHeight / 2 };   // orbit-view cursor
+export const viewOrigin = { x: window.innerWidth / 2, y: window.innerHeight / 2 };   // orbit center (middle-click moves it)
 
 export const IS_TOUCH = window.matchMedia('(pointer: coarse)').matches || 'ontouchstart' in window;
 if (IS_TOUCH) document.body.classList.add('touch');
@@ -31,9 +33,28 @@ window.addEventListener('keyup', e => { keys[e.code] = false; });
 // press-and-move (or hold >260 ms) repositions the sun.
 let rbDown = false, rbStartT = 0, rbStartX = 0, rbStartY = 0, sunDragging = false;
 let lastMX = 0, lastMY = 0;
+// mouse-orbit view tracking (v7.5) — frozen while dragging the sun
+window.addEventListener('mousemove', e => {
+  if (rbDown) return;
+  mouseView.x = e.clientX; mouseView.y = e.clientY;
+});
+// wheel zoom (v7.5): down = farther (up to map scale), up = closer, past the
+// plane = cockpit view
+window.addEventListener('wheel', e => {
+  e.preventDefault();
+  viewZoom.t = Math.max(0.07, Math.min(400, viewZoom.t * Math.exp(e.deltaY * 0.0012)));
+}, { passive: false });
 canvas.addEventListener('contextmenu', e => e.preventDefault());
 canvas.addEventListener('mousedown', e => {
   if (IS_TOUCH) return;   // touch uses the on-screen buttons + sun drag below
+  if (e.button === 1) {
+    e.preventDefault();   // suppress the middle-click autoscroll widget
+    viewOrigin.x = e.clientX; viewOrigin.y = e.clientY;   // view resets to center here
+    // zoom resets too, but ONLY from beyond the default: zoomed-in and
+    // cockpit views keep their zoom, middle-click just re-aims them (v7.5)
+    if (viewZoom.t > 1) viewZoom.t = 1;
+    return;
+  }
   if (e.button === 0) {
     fireGun();
     mouse.lmbDown = true; mouse.lastAuto = performance.now();

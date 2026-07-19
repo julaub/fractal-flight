@@ -92,7 +92,7 @@ export async function initRenderer(status, lock) {
   gl.vertexAttribPointer(locPos, 2, gl.FLOAT, false, 0, 0);
 
   ['uResolution','uTime','uCamPos','uCamMat','uSunDir','uFov','uJitter','uPixScale','uCraftPos','uCraftMat','uBulletPos','uBombPos','uBlastCell','uCloudPos','uCloudN',
-   'uRingsPos','uRingMats','uLivery','uOceanSlope','uOceanMax','uMassDecay','uMountAmp','uSnowLine','uFogDens','uJuliaC','uSnowFrac','uFloraDens','uFloraRange','uTreeSize','uTreeShare','uTreeTiers','uTreeFract','uCollected']
+   'uRingsPos','uRingMats','uLivery','uCockpit','uShadows','uFxPos','uOceanSlope','uOceanMax','uMassDecay','uMountAmp','uSnowLine','uFogDens','uJuliaC','uSnowFrac','uFloraDens','uFloraRange','uTreeSize','uTreeShare','uTreeTiers','uTreeFract','uCollected']
     .forEach(n => U[n] = gl.getUniformLocation(prog, n));
   return true;
 }

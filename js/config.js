@@ -25,5 +25,5 @@ export const BOMB_BOOST = 40;     // horizontal speed on top of the plane's own 
 
 // clouds / fx
 export const MAXCLOUD = 16;
-export const TRAIL_LIFE = 2.2;
+export const TRAIL_LIFE = 4.5;   // v7.4: contrails linger — the plane reads from afar
 export const POP_LIFE = 0.7;

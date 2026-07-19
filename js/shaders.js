@@ -24,6 +24,9 @@ uniform mat3 uCraftMat;
 uniform vec4 uRingsPos[8];    // ring course (jul): xyz center, w radius (w<=0 = inactive)
 uniform mat3 uRingMats[8];    // ring orientation [right | up | fwd]
 uniform vec3 uLivery;         // craft accent color (nose / wingtips / fin), start-page picker
+uniform float uCockpit;       // 1 = pilot view: the craft itself is not drawn
+uniform float uShadows;       // shadow pack master toggle (tune panel)
+uniform vec3 uFxPos[48];      // overlay-particle occlusion queries (probe row px 85..132)
 // ---- live tuning knobs (bottom-left panel) ----
 uniform float uOceanSlope;   // how fast the sea floor drops away from land
 uniform float uOceanMax;     // max ocean depth below the noise floor
@@ -533,6 +536,7 @@ vec3 toCraftLocal(vec3 wp) {
   return transpose(uCraftMat) * (wp - uCraftPos);
 }
 float marchCraft(vec3 ro, vec3 rd) {
+  if (uCockpit > 0.5) return -1.0;   // pilot view: we ARE the plane
   // bounding sphere first — skip the SDF entirely for most rays
   vec3 oc = ro - uCraftPos;
   float b = dot(oc, rd);
@@ -619,6 +623,84 @@ vec3 ringNormal(vec3 wp) {
   return normal;
 }
 
+// ---------- shadow pack (v7.6) ----------
+// Three light-blockers beyond the terrain's own soft shadow, all gated by
+// the tune-panel toggle. CRAFT: real — bounding-sphere test then a short SDF
+// march, penumbra widening with distance so the shadow melts away at
+// altitude. CLOUDS: analytic chord attenuation through each cluster's
+// bounding sphere — soft cumulus shade that drifts with the wind for free.
+// TREES: a smart fake — a soft blob under each LIVING tree, computed from
+// the same hashes + harvest texture as the geometry (so popping a tree
+// removes its shadow), offset along the sun direction.
+float craftShadow(vec3 p, vec3 sun) {
+  if (uShadows < 0.5) return 1.0;
+  vec3 oc = p - uCraftPos;
+  float b = dot(oc, sun);
+  if (b > 0.0) return 1.0;                    // craft is not sunward of p
+  float c = dot(oc, oc) - 36.0;               // r = 6: bounding + penumbra margin
+  float disc = b * b - c;
+  if (disc <= 0.0) return 1.0;
+  float sq = sqrt(disc);
+  float t1 = -b + sq;
+  float t = max(-b - sq, 0.0);
+  float res = 1.0;
+  for (int i = 0; i < 12; i++) {
+    float d = sdCraft(toCraftLocal(p + sun * t));
+    res = min(res, 16.0 * d / max(t, 4.0));   // penumbra widens with distance
+    if (res < 0.02 || t > t1) break;
+    t += max(d, 0.08);
+  }
+  // altitude fade: physically the umbra of a 6 m craft survives for hundreds
+  // of meters, but visually a dark blob from cruise height reads wrong —
+  // full shadow below 60 m, melted away by 160 m
+  float fade = 1.0 - smoothstep(60.0, 160.0, -b);
+  return clamp(mix(1.0, res, fade), 0.0, 1.0);
+}
+
+float cloudShadow(vec3 p, vec3 sun) {
+  if (uShadows < 0.5) return 1.0;
+  float att = 1.0;
+  for (int i = 0; i < 16; i++) {
+    if (float(i) >= uCloudN) break;
+    vec3 oc = p - uCloudPos[i].xyz;
+    float r = uCloudPos[i].w;
+    float b = dot(oc, sun);
+    if (b > 0.0) continue;
+    float c = dot(oc, oc) - r * r;
+    float disc = b * b - c;
+    if (disc <= 0.0) continue;
+    float chord = 2.0 * sqrt(disc) / max(r, 1.0);      // 0..2: path through the sphere
+    att *= 1.0 - 0.7 * smoothstep(0.15, 1.6, chord);   // dense core, wispy rim
+    if (att < 0.2) break;
+  }
+  return max(att, 0.18);                               // skylight keeps shade readable
+}
+
+float treeShadow(vec3 p, vec3 sun) {
+  if (uShadows < 0.5 || uFloraDens <= 0.001) return 1.0;
+  if (p.y < 5.0 || p.y > 140.0) return 1.0;            // greenbelt only (matches plantEval)
+  // walk back toward the sun to find candidate caster cells; 3x3 covers
+  // every tree size and center jitter
+  vec2 sunH = sun.xz / max(sun.y, 0.35);
+  vec2 q = p.xz + sunH * (0.30 * uTreeSize);
+  vec2 base = floor(q / FCELL) - 1.0;
+  float att = 1.0;
+  for (int cy = 0; cy < 3; cy++)
+  for (int cx = 0; cx < 3; cx++) {
+    vec2 cell = base + vec2(float(cx), float(cy));
+    float rnd = hash(cell);
+    if (rnd > uFloraDens) continue;                    // no plant here
+    if (texelFetch(uCollected, ivec2(mod(cell, 512.0)), 0).r > 0.5) continue; // harvested
+    float s = mix(1.6, uTreeSize, pow(hash(cell + 51.0), mix(5.0, 1.2, uTreeShare)));
+    if (s < 3.0) continue;                             // ferns: too small to matter
+    vec2 ctr = (cell + 0.5) * FCELL + (vec2(hash(cell + 13.0), hash(cell + 37.0)) - 0.5) * 12.0;
+    vec2 sp = ctr - sunH * (0.55 * s);                 // where the crown's shade lands
+    float dd = length(p.xz - sp) / (0.45 * s + 1.2);
+    att *= 1.0 - 0.5 * (1.0 - smoothstep(0.55, 1.0, dd));
+  }
+  return att;
+}
+
 // probe payload encoders: height → 24-bit fixed point over [-80, 560],
 // plant distance → 8 bits over [0, 40] m
 vec4 encodeHeight(float gh) {
@@ -640,7 +722,7 @@ void main() {
   //   px 82..84     terrain height at bomb slot k (3 slots)
   // JS reads the row back each frame in one readPixels, so all collision
   // agrees with the rendered geometry bit-for-bit.
-  if (gl_FragCoord.y < 1.0 && gl_FragCoord.x < 85.0) {
+  if (gl_FragCoord.y < 1.0 && gl_FragCoord.x < 133.0) {
     int px = int(gl_FragCoord.x);
     if (px < 18) {
       vec3 pp = (px < 2) ? uCraftPos : uBulletPos[(px - 2) / 2];
@@ -653,8 +735,33 @@ void main() {
       vec2 c = uBlastCell[px - 18];
       float gh = terrainShape(c);
       fragColor = encodePlantD(plantEval(vec3(c.x, gh + 4.0, c.y), 4.0, 0.0).x / 0.45);
-    } else {
+    } else if (px < 85) {
       fragColor = encodeHeight(terrainShape(uBombPos[px - 82].xz));
+    } else {
+      // fx occlusion probe (v7.9): is this overlay particle (contrail dot,
+      // tracer, bomb, blast ring) hidden behind terrain from the camera?
+      // Marches the SAME terrainShape the pixels render, so overlay
+      // visibility agrees with the mountains bit-for-bit. Soft answer:
+      // grazing a ridge fades instead of popping.
+      vec3 pt = uFxPos[px - 85];
+      vec3 dv = pt - uCamPos;
+      float L = length(dv);
+      float vis = 1.0;
+      if (L > 25.0) {
+        vec3 rd = dv / L;
+        float t = 12.0;
+        float mn = 1.0;
+        for (int i = 0; i < 48; i++) {
+          if (t > L - 10.0) break;
+          vec3 p = uCamPos + rd * t;
+          float h = p.y - terrainShape(p.xz);
+          mn = min(mn, h / 10.0);
+          if (mn < 0.0) break;
+          t += max(h * 0.7, 10.0);
+        }
+        vis = clamp(mn, 0.0, 1.0);
+      }
+      fragColor = vec4(vis, vis, vis, 1.0);
     }
     return;
   }
@@ -687,7 +794,7 @@ void main() {
     vec3 n = terrainNormal(pos.xz, px);
     vec3 alb = terrainColor(pos, n, pos.y, px);
     float ndl = clamp(dot(n, sun), 0.0, 1.0);
-    float sh = (ndl > 0.02) ? softShadow(pos + n * 1.0, sun) : 0.0; // skip shadow ray on sun-averted slopes
+    float sh = (ndl > 0.02) ? softShadow(pos + n * 1.0, sun) * craftShadow(pos, sun) * cloudShadow(pos, sun) * treeShadow(pos, sun) : 0.0; // + v7.6 shadow pack
     float dif = ndl * sh;
     float skyA = clamp(0.5 + 0.5 * n.y, 0.0, 1.0);
     float bnc = clamp(dot(n, normalize(vec3(-sun.x, 0.0, -sun.z))), 0.0, 1.0);
@@ -716,7 +823,7 @@ void main() {
     vec3 refl = skyColor(rr, sun);
     float fres = 0.03 + 0.97 * pow(1.0 - clamp(dot(-rd, n), 0.0, 1.0), 5.0);
     vec3 base = mix(vec3(0.10, 0.30, 0.28), vec3(0.02, 0.10, 0.13), depth); // glacial teal
-    float sh = softShadow(pos + vec3(0.0, 0.5, 0.0), sun);
+    float sh = softShadow(pos + vec3(0.0, 0.5, 0.0), sun) * craftShadow(pos, sun) * cloudShadow(pos, sun);
     col = mix(base, refl, fres);
     vec3 glint = mix(vec3(1.0, 0.80, 0.50), vec3(1.1, 0.45, 0.20), duskAmount(sun));
     col += glint * pow(clamp(dot(rr, sun), 0.0, 1.0), 260.0) * 3.0 * fres * sh;
@@ -739,7 +846,7 @@ void main() {
     vec2 ctr = (cell + 0.5) * FCELL + (vec2(hash(cell + 13.0), hash(cell + 37.0)) - 0.5) * 12.0;
     vec3 n = normalize(vec3(pos.x - ctr.x, 2.4, pos.z - ctr.y));
     float ndl = clamp(dot(n, sun), 0.0, 1.0);
-    float sh = (ndl > 0.02) ? softShadow(pos + vec3(0.0, 1.2, 0.0), sun) : 0.0;
+    float sh = (ndl > 0.02) ? softShadow(pos + vec3(0.0, 1.2, 0.0), sun) * craftShadow(pos, sun) * cloudShadow(pos, sun) : 0.0;
     vec3 lin = sunLightCol(sun) * 2.0 * ndl * sh
              + skyAmbCol(sun) * 0.55 * clamp(0.5 + 0.5 * n.y, 0.0, 1.0);
     col = alb * lin;
@@ -769,7 +876,7 @@ void main() {
     float angle = atan(lp.y, lp.x);
     float stripe = step(0.0, sin(angle * 8.0 + uTime * 6.0));
     vec3 alb = mix(vec3(1.0, 0.85, 0.2), vec3(0.9, 0.5, 0.0), stripe * 0.6);
-    float sh = softShadow(pos + n * 0.5, sun);
+    float sh = softShadow(pos + n * 0.5, sun) * cloudShadow(pos, sun);
     float dif = clamp(dot(n, sun), 0.0, 1.0) * sh;
     float skyA = clamp(0.5 + 0.5 * n.y, 0.0, 1.0);
     vec3 lin = sunLightCol(sun) * 1.5 * dif + skyAmbCol(sun) * 0.6 * skyA;
@@ -789,7 +896,7 @@ void main() {
     vec3 alb = vec3(0.88, 0.89, 0.92);
     float red = clamp(step(1.65, lp.z) + step(2.55, abs(lp.x)) + ((lp.y > 0.35 && lp.z < -1.6) ? 1.0 : 0.0), 0.0, 1.0);
     alb = mix(alb, uLivery, red);
-    float sh = softShadow(pos, sun);
+    float sh = softShadow(pos, sun) * cloudShadow(pos, sun);
     float dif = clamp(dot(n, sun), 0.0, 1.0) * sh;
     float skyA = clamp(0.5 + 0.5 * n.y, 0.0, 1.0);
     vec3 lin = sunLightCol(sun) * 2.2 * dif + skyAmbCol(sun) * 0.55 * skyA;
